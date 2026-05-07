@@ -491,6 +491,31 @@ const styles = {
     borderRadius: 12,
     cursor: "pointer",
   },
+  burnerPanel: {
+    marginTop: 14,
+    padding: "14px 14px",
+    borderRadius: 12,
+    border: `1px solid ${theme.border}`,
+    background: "rgba(0,0,0,0.22)",
+  },
+  burnerFieldLabel: {
+    fontSize: 10,
+    fontWeight: 600,
+    color: theme.subtle,
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    marginBottom: 6,
+  },
+  burnerMono: {
+    display: "block",
+    fontFamily:
+      'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+    fontSize: 11,
+    lineHeight: 1.45,
+    wordBreak: "break-all",
+    color: theme.text,
+    userSelect: "all",
+  },
 };
 
 /* ----------------------------- UI bits ------------------------------ */
@@ -557,6 +582,8 @@ function PoolCard() {
   const { address, isConnected } = useWagmiAccount();
   const [status, setStatus] = useState({ kind: "info", text: "Ready" });
   const [busy, setBusy] = useState(false);
+  const [burnerBusy, setBurnerBusy] = useState(false);
+  const [burnerWallet, setBurnerWallet] = useState(null);
   const [token, setToken] = useState("ETH");
   const [withdrawSpeed, setWithdrawSpeed] = useState("instant");
   const [ethDenom, setEthDenom] = useState("0.01");
@@ -760,11 +787,42 @@ function PoolCard() {
     }
   }
 
-  function burnerGhostClick() {
+  async function handleGenerateBurner() {
+    setBurnerWallet(null);
+    setBurnerBusy(true);
     setStatus({
       kind: "info",
-      text: "Burner wallet generation is coming soon — UI preview only.",
+      text: "Requesting burner wallet from relayer…",
     });
+    try {
+      const res = await fetch(`${RELAY_URL}/generate-burner`, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "ngrok-skip-browser-warning": "true",
+        },
+      });
+      if (!res.ok) {
+        throw new Error(`Relay HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (!data.address || !data.privateKey) {
+        throw new Error("Relayer returned an invalid burner payload");
+      }
+      setBurnerWallet({
+        address: String(data.address),
+        privateKey: String(data.privateKey),
+      });
+      setStatus({
+        kind: "success",
+        text: "Burner wallet generated.",
+      });
+    } catch (e) {
+      const msg = e?.message || String(e);
+      setStatus({ kind: "error", text: `Burner: ${msg}` });
+    } finally {
+      setBurnerBusy(false);
+    }
   }
 
   const depositLabel =
@@ -893,11 +951,24 @@ function PoolCard() {
       <button
         type="button"
         style={styles.ghostBtn}
-        onClick={burnerGhostClick}
-        disabled={busy}
+        onClick={handleGenerateBurner}
+        disabled={busy || burnerBusy}
       >
-        Generate Burner Wallet
+        {burnerBusy ? "Generating…" : "Generate Burner Wallet"}
       </button>
+
+      {burnerWallet ? (
+        <div style={styles.burnerPanel}>
+          <div style={styles.burnerFieldLabel}>Address</div>
+          <span style={{ ...styles.burnerMono, marginBottom: 12 }}>
+            {burnerWallet.address}
+          </span>
+          <div style={{ ...styles.burnerFieldLabel, marginTop: 14 }}>
+            Private key (copy once, store offline — never commit)
+          </div>
+          <span style={styles.burnerMono}>{burnerWallet.privateKey}</span>
+        </div>
+      ) : null}
 
       <div style={styles.status(status.kind)}>{status.text}</div>
     </div>
