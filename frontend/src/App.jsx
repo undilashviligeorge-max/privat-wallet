@@ -62,10 +62,10 @@ if (typeof window !== "undefined") {
 /** True only if a real `window.ethereum` existed before the shield stub (not the placeholder). */
 const isMetaMaskInstalled = hadRealEthereumBeforeShield;
 
-const POOL_ADDRESS = "0x77490d9542F85B12fE888924930CC3de7fabfaB2";
+const POOL_ADDRESS = "0x84025852E750693826bC12596F1E917343CFdbAE";
 
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
-const MOCK_USDT_ADDRESS = "0x15095AD5c60c4194f84D3BCde03e67ae46e1Fb03";
+const MOCK_USDT_ADDRESS = "0x41DA8EaeC31F04bf29f1c30F046DD9A1Eef1218A";
 
 /** Public HTTPS base URL for the relayer (Ngrok tunnel to localhost:3000). No trailing slash. */
 const RELAY_URL = "https://dodge-reflex-hangnail.ngrok-free.dev";
