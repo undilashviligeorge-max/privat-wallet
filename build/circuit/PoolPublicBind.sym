@@ -1,0 +1,10 @@
+1,1,0,main.stateRoot
+2,2,0,main.aspRoot
+3,3,0,main.nullifierHash
+4,4,0,main.recipient
+5,5,0,main.relayer
+6,6,0,main.fee
+7,7,0,main.ab
+8,8,0,main.cd
+9,9,0,main.ef
+10,10,0,main.sum

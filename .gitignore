@@ -1,0 +1,11 @@
+.env
+.env.*
+node_modules/
+frontend/node_modules/
+cache/
+coverage/
+coverage.json
+frontend/dist/
+.DS_Store
+*.log
+*.ptau

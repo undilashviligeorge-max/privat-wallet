@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Telegram Privacy Pool</title>
+    <script>
+      // Quiet on-page error logger. No alert() calls — those caused user-
+      // visible noise during the React loop. Logs to console and surfaces
+      // a small red overlay if a real error happens, otherwise invisible.
+      (function () {
+        function show(text) {
+          try {
+            var el = document.getElementById("__err_overlay__");
+            if (!el) {
+              el = document.createElement("pre");
+              el.id = "__err_overlay__";
+              el.style.cssText =
+                "position:fixed;left:8px;right:8px;bottom:8px;z-index:99999;" +
+                "max-height:40vh;overflow:auto;padding:10px 12px;border-radius:8px;" +
+                "background:rgba(255,107,107,0.92);color:#0b0d12;font:11px/1.4 ui-monospace," +
+                "Menlo,monospace;white-space:pre-wrap;word-break:break-word;" +
+                "box-shadow:0 8px 24px rgba(0,0,0,0.35);";
+              (document.body || document.documentElement).appendChild(el);
+            }
+            el.textContent += (el.textContent ? "\n\n" : "") + text;
+          } catch (_) {}
+        }
+        window.onerror = function (msg, url, line, col, err) {
+          try { console.error("[onerror]", msg, err); } catch (_) {}
+          show("Error: " + msg + "\nLine: " + line + (col ? ":" + col : "") +
+               (err && err.stack ? "\n" + err.stack : ""));
+        };
+        window.onunhandledrejection = function (e) {
+          var r = e && e.reason;
+          var t = (r && (r.stack || r.message)) || String(r);
+          try { console.error("[unhandledrejection]", r); } catch (_) {}
+          show("Promise Rejection: " + t);
+        };
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
