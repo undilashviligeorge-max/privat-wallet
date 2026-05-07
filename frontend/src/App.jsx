@@ -24,6 +24,40 @@ import {
 } from "@wagmi/core";
 import { sepolia } from "@wagmi/core/chains";
 
+/**
+ * Browser-readable Sepolia JSON-RPC URL. Avoid rpc.sepolia.org (often blocks CORS).
+ * Priority: `VITE_SEPOLIA_RPC_URL` → Alchemy (`VITE_ALCHEMY_KEY`) → Infura → PublicNode (CORS-friendly).
+ */
+function resolveSepoliaReadRpcUrl() {
+  const env =
+    typeof import.meta !== "undefined" && import.meta.env ? import.meta.env : {};
+  const explicit = String(env.VITE_SEPOLIA_RPC_URL || "").trim();
+  if (explicit) return explicit;
+
+  const alchemyKey = String(env.VITE_ALCHEMY_KEY || "").trim();
+  if (alchemyKey) return `https://eth-sepolia.g.alchemy.com/v2/${alchemyKey}`;
+
+  const infuraKey = String(env.VITE_INFURA_KEY || "").trim();
+  if (infuraKey) return `https://sepolia.infura.io/v3/${infuraKey}`;
+
+  return "https://ethereum-sepolia-rpc.publicnode.com";
+}
+
+const SEPOLIA_READ_RPC = resolveSepoliaReadRpcUrl();
+
+/** Groth16 assets in `frontend/public` (site-root URLs for Vercel / Vite). Used when wiring client-side proofs. */
+const CIRCUIT_WASM_URL = "/circuit.wasm";
+const CIRCUIT_ZKEY_URL = "/circuit.zkey";
+
+/** Sepolia chain for wagmi: same IDs as `@wagmi/core/chains` sepolia, custom RPC URL. */
+const sepoliaForApp = {
+  ...sepolia,
+  rpcUrls: {
+    default: { http: [SEPOLIA_READ_RPC] },
+    public: { http: [SEPOLIA_READ_RPC] },
+  },
+};
+
 /* ------------------------------------------------------------------ *
  * Shield — runs as soon as this module executes (after its imports). *
  * ------------------------------------------------------------------ */
@@ -154,7 +188,7 @@ function initWeb3Once() {
   web3Initialized = true;
   try {
     const { chains, publicClient } = configureChains(
-      [sepolia],
+      [sepoliaForApp],
       [w3mProvider({ projectId: WC_PROJECT_ID })]
     );
 
@@ -619,7 +653,7 @@ function PoolCard() {
       }
 
       try {
-        const provider = new JsonRpcProvider("https://rpc.sepolia.org");
+        const provider = new JsonRpcProvider(SEPOLIA_READ_RPC);
         const pool = new Contract(POOL_ADDRESS, POOL_ABI, provider);
         const [eD, eP, uD, uP] = await Promise.all([
           pool.ETH_DENOMINATION(),
