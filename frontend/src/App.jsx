@@ -85,7 +85,12 @@ const POOL_ADDRESS = "0x84025852E750693826bC12596F1E917343CFdbAE";
 const MOCK_USDT_ADDRESS = "0x41DA8EaeC31F04bf29f1c30F046DD9A1Eef1218A";
 
 /** Public HTTPS base URL for the relayer (Ngrok tunnel to localhost:3000). No trailing slash. */
-const RELAY_URL = "https://dodge-reflex-hangnail.ngrok-free.dev";
+const RELAY_URL = String(
+  (typeof import.meta !== "undefined" &&
+    import.meta.env &&
+    import.meta.env.VITE_RELAY_URL) ||
+    "https://dodge-reflex-hangnail.ngrok-free.dev"
+).trim();
 
 /** WalletConnect Cloud project id (required non-empty string for WalletConnect v2). */
 const WC_PROJECT_ID = (() => {
