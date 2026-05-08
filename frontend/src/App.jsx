@@ -858,25 +858,33 @@ function PoolCard() {
       if (!eip1193?.request) return;
       const chainIdHex = "0x" + SEPOLIA_CHAIN_ID.toString(16);
       try {
-        await eip1193.request({
-          method: "wallet_switchEthereumChain",
-          params: [{ chainId: chainIdHex }],
-        });
+        await withTimeout(
+          eip1193.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: chainIdHex }],
+          }),
+          60_000,
+          "wallet_switchEthereumChain(Sepolia)"
+        );
       } catch (e) {
         const code = e?.code;
         if (code === 4902 || code === -32603) {
-          await eip1193.request({
-            method: "wallet_addEthereumChain",
-            params: [
-              {
-                chainId: chainIdHex,
-                chainName: "Sepolia",
-                nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-                rpcUrls: [SEPOLIA_READ_RPC],
-                blockExplorerUrls: ["https://sepolia.etherscan.io"],
-              },
-            ],
-          });
+          await withTimeout(
+            eip1193.request({
+              method: "wallet_addEthereumChain",
+              params: [
+                {
+                  chainId: chainIdHex,
+                  chainName: "Sepolia",
+                  nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                  rpcUrls: [SEPOLIA_READ_RPC],
+                  blockExplorerUrls: ["https://sepolia.etherscan.io"],
+                },
+              ],
+            }),
+            60_000,
+            "wallet_addEthereumChain(Sepolia)"
+          );
         } else {
           throw new Error("Please switch your wallet to Sepolia.");
         }
