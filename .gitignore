@@ -9,3 +9,4 @@ frontend/dist/
 .DS_Store
 *.log
 *.ptau
+.npm-vercel-cache/
