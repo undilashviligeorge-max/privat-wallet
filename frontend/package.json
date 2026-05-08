@@ -15,6 +15,7 @@
     "ethers": "^6.16.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "snarkjs": "^0.7.6",
     "viem": "1.21.4"
   },
   "devDependencies": {

@@ -28,10 +28,192 @@ import { sepolia } from "@wagmi/core/chains";
 const SEPOLIA_READ_RPC = "https://ethereum-sepolia-rpc.publicnode.com";
 
 /**
- * Groth16 artifacts copied to `frontend/public/` — root-relative URLs on Vercel/Vite (`/circuit.wasm`, `/circuit.zkey`).
+ * Groth16 artifacts served from `frontend/public/` as root-relative URLs (`/file.ext`).
+ * Must match real files on disk after `vite build` / Vercel static deploy.
  */
 const CIRCUIT_WASM_URL = "/circuit.wasm";
-const CIRCUIT_ZKEY_URL = "/circuit.zkey";
+const CIRCUIT_ZKEY_URL = "/circuit_final.zkey";
+
+/** How long to wait for the wallet to return a signer (Telegram / WalletConnect can stall). */
+const SIGNER_TIMEOUT_MS = 180_000;
+
+function circuitArtifactAbsoluteUrls() {
+  if (typeof window === "undefined") {
+    return { wasmUrl: CIRCUIT_WASM_URL, zkeyUrl: CIRCUIT_ZKEY_URL };
+  }
+  const base = window.location.origin.replace(/\/$/, "");
+  return {
+    wasmUrl: `${base}${CIRCUIT_WASM_URL}`,
+    zkeyUrl: `${base}${CIRCUIT_ZKEY_URL}`,
+  };
+}
+
+function withTimeout(promise, ms, label) {
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => {
+      reject(
+        new Error(
+          `${label} — no response after ${Math.round(ms / 1000)}s. ` +
+            "If you use WalletConnect or a Telegram in-app browser, approve the connection or open in an external browser."
+        )
+      );
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+/**
+ * Fetches proving artifacts and loads snarkjs so CORS/404/MIME issues surface as loud errors.
+ * Note: this pool's deposit only needs a random bytes32 commitment on-chain; Groth16 + fullProve
+ * is for withdrawal. We still verify artifacts here because a broken setup mimics a "stuck" UI.
+ */
+async function verifySnarkArtifactsStepByStep() {
+  const { wasmUrl, zkeyUrl } = circuitArtifactAbsoluteUrls();
+
+  console.log("[deposit][snark] Step 1/5: absolute URLs resolved", {
+    wasmUrl,
+    zkeyUrl,
+    pathWasm: CIRCUIT_WASM_URL,
+    pathZkey: CIRCUIT_ZKEY_URL,
+  });
+
+  let wasmRes;
+  try {
+    console.log("[deposit][snark] Step 2/5: fetching wasm…");
+    wasmRes = await fetch(wasmUrl, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Accept: "application/wasm, application/octet-stream, */*" },
+    });
+  } catch (e) {
+    console.error("[deposit][snark] WASM fetch network error:", e);
+    throw new Error(
+      `[SNARK WASM FETCH FAILED — network/CORS]\nURL: ${wasmUrl}\n` +
+        `${e?.message || e}\n\nCheck DevTools → Network for blocked requests.`
+    );
+  }
+
+  if (!wasmRes.ok) {
+    const bodyPreview = (await wasmRes.text().catch(() => "")).slice(0, 500);
+    console.error("[deposit][snark] WASM HTTP error", wasmRes.status, bodyPreview);
+    throw new Error(
+      `[SNARK WASM HTTP ${wasmRes.status}]\nURL: ${wasmUrl}\n` +
+        `Body preview:\n${bodyPreview || "(empty)"}\n\nFile must exist under frontend/public/ and deploy with the app.`
+    );
+  }
+
+  const wasmCt = wasmRes.headers.get("content-type") || "";
+  console.log("[deposit][snark] Step 2/5 OK: wasm response", {
+    status: wasmRes.status,
+    contentType: wasmCt,
+  });
+
+  let wasmBuffer;
+  try {
+    wasmBuffer = await wasmRes.arrayBuffer();
+  } catch (e) {
+    console.error("[deposit][snark] WASM arrayBuffer failed:", e);
+    throw new Error(
+      `[SNARK WASM READ FAILED]\n${e?.message || e}\nURL was: ${wasmUrl}`
+    );
+  }
+
+  const wasmBytes = new Uint8Array(wasmBuffer);
+  console.log("[deposit][snark] wasm byte length =", wasmBytes.byteLength);
+
+  let zkeyRes;
+  try {
+    console.log("[deposit][snark] Step 3/5: fetching zkey…");
+    zkeyRes = await fetch(zkeyUrl, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Accept: "application/octet-stream, */*" },
+    });
+  } catch (e) {
+    console.error("[deposit][snark] ZKEY fetch network error:", e);
+    throw new Error(
+      `[SNARK ZKEY FETCH FAILED — network/CORS]\nURL: ${zkeyUrl}\n${e?.message || e}`
+    );
+  }
+
+  if (!zkeyRes.ok) {
+    const preview = (await zkeyRes.text().catch(() => "")).slice(0, 500);
+    console.error("[deposit][snark] ZKEY HTTP error", zkeyRes.status, preview);
+    throw new Error(
+      `[SNARK ZKEY HTTP ${zkeyRes.status}]\nURL: ${zkeyUrl}\n` +
+        `Body preview:\n${preview || "(empty)"}`
+    );
+  }
+
+  const zkeyCt = zkeyRes.headers.get("content-type") || "";
+  console.log("[deposit][snark] Step 3/5 OK: zkey response", {
+    status: zkeyRes.status,
+    contentType: zkeyCt,
+  });
+
+  let zkeyBuffer;
+  try {
+    zkeyBuffer = await zkeyRes.arrayBuffer();
+  } catch (e) {
+    console.error("[deposit][snark] ZKEY arrayBuffer failed:", e);
+    throw new Error(`[SNARK ZKEY READ FAILED]\n${e?.message || e}`);
+  }
+
+  const zkeyBytes = new Uint8Array(zkeyBuffer);
+  console.log("[deposit][snark] zkey byte length =", zkeyBytes.byteLength);
+
+  let snarkjs;
+  try {
+    console.log("[deposit][snark] Step 4/5: dynamic import('snarkjs')…");
+    snarkjs = await import("snarkjs");
+    console.log("[deposit][snark] Step 4/5 OK: snarkjs keys", Object.keys(snarkjs));
+  } catch (e) {
+    console.error("[deposit][snark] snarkjs import failed:", e);
+    throw new Error(
+      `[SNARKJS MODULE FAILED TO LOAD]\n${e?.message || e}\n${e?.stack || ""}`
+    );
+  }
+
+  if (typeof snarkjs.groth16?.fullProve !== "function") {
+    throw new Error(
+      "[SNARKJS] groth16.fullProve is not a function — broken or incompatible snarkjs build."
+    );
+  }
+
+  console.log(
+    "[deposit][snark] Step 5/5: groth16.fullProve in try/catch (invalid inputs — should reject quickly; deposit does not use a real witness)."
+  );
+  try {
+    await withTimeout(
+      snarkjs.groth16.fullProve(null, wasmBytes, zkeyBytes),
+      15_000,
+      "groth16.fullProve(null, …) sanity check"
+    );
+    console.warn(
+      "[deposit][snark] fullProve resolved without error — unexpected for null inputs."
+    );
+  } catch (proveErr) {
+    console.log(
+      "[deposit][snark] fullProve caught (expected):",
+      proveErr?.message || proveErr
+    );
+  }
+
+  console.log(
+    "[deposit][snark] Artifacts + snarkjs OK. If deposit still hangs after this log, the blocker is wallet/RPC — not wasm/zkey fetch."
+  );
+
+  return { wasmBytes, zkeyBytes, snarkjs };
+}
+
+function formatDepositFailure(step, e) {
+  const short =
+    e?.shortMessage || e?.reason || e?.message || String(e);
+  const stack = e?.stack ? `\n\nStack:\n${e.stack}` : "";
+  console.error(`[deposit] FAILED at step: ${step}`, e);
+  return `Deposit failed — ${step}\n${short}${stack}`;
+}
 
 const sepoliaForApp = {
   ...sepolia,
@@ -727,52 +909,169 @@ function PoolCard() {
       return;
     }
     if (!address) return;
-    setBusy(true);
-    setStatus({ kind: "info", text: "Generating commitment…" });
-    try {
-      const commitment = randomCommitment();
-      lastCommitment.current = commitment;
 
-      const signer = await ensureSepoliaSigner();
-      const pool = new Contract(POOL_ADDRESS, POOL_ABI, signer);
+    setBusy(true);
+    const runId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    console.log(`[deposit] === start run ${runId} ===`);
+
+    try {
+      console.log("[deposit] Step A: status → Generating commitment");
+      setStatus({ kind: "info", text: "Generating commitment…" });
+
+      let commitment;
+      try {
+        commitment = randomCommitment();
+        lastCommitment.current = commitment;
+        console.log("[deposit] Step B: commitment bytes32 =", commitment);
+      } catch (e) {
+        throw new Error(formatDepositFailure("randomCommitment / crypto.getRandomValues", e));
+      }
+
+      console.log("[deposit] Step C: verifying SNARK artifacts + snarkjs (fetch + optional diagnostic prove)");
+      setStatus({
+        kind: "info",
+        text: "Checking ZK files (wasm/zkey) and SnarkJS…",
+      });
+      try {
+        await verifySnarkArtifactsStepByStep();
+      } catch (e) {
+        throw new Error(
+          formatDepositFailure("verifySnarkArtifactsStepByStep (404/CORS/snarkjs)", e)
+        );
+      }
+
+      console.log("[deposit] Step D: obtaining wallet signer (timeout may apply)");
+      setStatus({
+        kind: "info",
+        text: "Connecting wallet — approve in MetaMask or WalletConnect…",
+      });
+      let signer;
+      try {
+        signer = await withTimeout(
+          ensureSepoliaSigner(),
+          SIGNER_TIMEOUT_MS,
+          "ensureSepoliaSigner()"
+        );
+        const fromAddr = await signer.getAddress();
+        console.log("[deposit] Step E: signer OK", fromAddr);
+      } catch (e) {
+        throw new Error(
+          formatDepositFailure(
+            "ensureSepoliaSigner (wallet chain / WalletConnect)",
+            e
+          )
+        );
+      }
+
+      let pool;
+      try {
+        pool = new Contract(POOL_ADDRESS, POOL_ABI, signer);
+        console.log("[deposit] Step F: contract instance for pool", POOL_ADDRESS);
+      } catch (e) {
+        throw new Error(formatDepositFailure("Contract(POOL_ADDRESS)", e));
+      }
 
       if (token === "ETH") {
+        setStatus({ kind: "info", text: "Reading required ETH deposit from pool…" });
+        let value;
+        try {
+          value = await pool.depositAmountRequired();
+          console.log("[deposit] Step G: depositAmountRequired =", value.toString());
+        } catch (e) {
+          throw new Error(formatDepositFailure("pool.depositAmountRequired()", e));
+        }
+
         setStatus({ kind: "info", text: "Awaiting wallet (ETH deposit)…" });
-        const value = await pool.depositAmountRequired();
-        const tx = await pool.deposit(commitment, { value });
+        let tx;
+        try {
+          tx = await pool.deposit(commitment, { value });
+          console.log("[deposit] Step H: deposit tx submitted", tx.hash);
+        } catch (e) {
+          throw new Error(formatDepositFailure("pool.deposit(commitment)", e));
+        }
+
         setStatus({
           kind: "info",
           text: `Submitted: ${tx.hash.slice(0, 10)}… (waiting for confirmation)`,
         });
-        const receipt = await tx.wait();
+        let receipt;
+        try {
+          receipt = await tx.wait();
+          console.log("[deposit] Step I: confirmed block", receipt.blockNumber);
+        } catch (e) {
+          throw new Error(formatDepositFailure("tx.wait() ETH deposit", e));
+        }
+
         setStatus({
           kind: "success",
           text: `ETH deposit confirmed in block ${receipt.blockNumber}.`,
         });
       } else {
-        const amount = await pool.usdtDepositAmountRequired();
+        setStatus({ kind: "info", text: "Reading required USDT deposit from pool…" });
+        let amount;
+        try {
+          amount = await pool.usdtDepositAmountRequired();
+          console.log("[deposit] Step G: usdtDepositAmountRequired =", amount.toString());
+        } catch (e) {
+          throw new Error(
+            formatDepositFailure("pool.usdtDepositAmountRequired()", e)
+          );
+        }
+
         const usdt = new Contract(MOCK_USDT_ADDRESS, ERC20_ABI, signer);
-        const allowance = await usdt.allowance(address, POOL_ADDRESS);
+        let allowance;
+        try {
+          allowance = await usdt.allowance(address, POOL_ADDRESS);
+          console.log("[deposit] allowance vs required", allowance.toString(), amount.toString());
+        } catch (e) {
+          throw new Error(formatDepositFailure("usdt.allowance", e));
+        }
+
         if (allowance < amount) {
           setStatus({ kind: "info", text: "Approving Mock USDT…" });
-          const txA = await usdt.approve(POOL_ADDRESS, MaxUint256);
-          await txA.wait();
+          try {
+            const txA = await usdt.approve(POOL_ADDRESS, MaxUint256);
+            console.log("[deposit] approve tx", txA.hash);
+            await txA.wait();
+          } catch (e) {
+            throw new Error(formatDepositFailure("usdt.approve", e));
+          }
         }
+
         setStatus({ kind: "info", text: "Awaiting wallet (USDT deposit)…" });
-        const txD = await pool.depositUsdt(commitment);
+        let txD;
+        try {
+          txD = await pool.depositUsdt(commitment);
+          console.log("[deposit] depositUsdt tx", txD.hash);
+        } catch (e) {
+          throw new Error(formatDepositFailure("pool.depositUsdt", e));
+        }
+
         setStatus({
           kind: "info",
           text: `Submitted: ${txD.hash.slice(0, 10)}… (waiting for confirmation)`,
         });
-        const receipt = await txD.wait();
+        let receipt;
+        try {
+          receipt = await txD.wait();
+        } catch (e) {
+          throw new Error(formatDepositFailure("tx.wait() USDT deposit", e));
+        }
+
         setStatus({
           kind: "success",
           text: `USDT deposit confirmed in block ${receipt.blockNumber}.`,
         });
       }
+
+      console.log(`[deposit] === success run ${runId} ===`);
     } catch (e) {
-      const msg = e?.shortMessage || e?.reason || e?.message || String(e);
-      setStatus({ kind: "error", text: `Deposit failed: ${msg}` });
+      const msg =
+        typeof e?.message === "string" && e.message.startsWith("Deposit failed")
+          ? e.message
+          : formatDepositFailure("unknown", e);
+      console.error(`[deposit] === FAILED run ${runId} ===`, e);
+      setStatus({ kind: "error", text: msg });
     } finally {
       setBusy(false);
     }
