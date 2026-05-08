@@ -8,7 +8,15 @@ import React, {
   useState,
   useSyncExternalStore,
 } from "react";
-import { BrowserProvider, Contract, JsonRpcProvider, formatEther, formatUnits, MaxUint256 } from "ethers";
+import {
+  BrowserProvider,
+  Contract,
+  JsonRpcProvider,
+  formatEther,
+  formatUnits,
+  MaxUint256,
+  zeroPadValue,
+} from "ethers";
 import { w3mProvider } from "@web3modal/ethereum";
 import { WalletConnectConnector } from "@wagmi/core/connectors/walletConnect";
 import { InjectedConnector } from "@wagmi/core/connectors/injected";
@@ -64,14 +72,13 @@ function withTimeout(promise, ms, label) {
 }
 
 /**
- * Fetches proving artifacts and loads snarkjs so CORS/404/MIME issues surface as loud errors.
- * Note: this pool's deposit only needs a random bytes32 commitment on-chain; Groth16 + fullProve
- * is for withdrawal. We still verify artifacts here because a broken setup mimics a "stuck" UI.
+ * Fetch wasm/zkey and load snarkjs (shared by deposit sanity check + withdraw proving).
+ * @param {string} logTag e.g. "[deposit][snark]" or "[withdraw][zk]"
  */
-async function verifySnarkArtifactsStepByStep() {
+async function loadGroth16Artifacts(logTag) {
   const { wasmUrl, zkeyUrl } = circuitArtifactAbsoluteUrls();
 
-  console.log("[deposit][snark] Step 1/5: absolute URLs resolved", {
+  console.log(`${logTag} Step 1/4: absolute URLs`, {
     wasmUrl,
     zkeyUrl,
     pathWasm: CIRCUIT_WASM_URL,
@@ -80,14 +87,14 @@ async function verifySnarkArtifactsStepByStep() {
 
   let wasmRes;
   try {
-    console.log("[deposit][snark] Step 2/5: fetching wasm…");
+    console.log(`${logTag} Step 2/4: fetching wasm…`);
     wasmRes = await fetch(wasmUrl, {
       method: "GET",
       cache: "no-store",
       headers: { Accept: "application/wasm, application/octet-stream, */*" },
     });
   } catch (e) {
-    console.error("[deposit][snark] WASM fetch network error:", e);
+    console.error(`${logTag} WASM fetch network error:`, e);
     throw new Error(
       `[SNARK WASM FETCH FAILED — network/CORS]\nURL: ${wasmUrl}\n` +
         `${e?.message || e}\n\nCheck DevTools → Network for blocked requests.`
@@ -96,7 +103,7 @@ async function verifySnarkArtifactsStepByStep() {
 
   if (!wasmRes.ok) {
     const bodyPreview = (await wasmRes.text().catch(() => "")).slice(0, 500);
-    console.error("[deposit][snark] WASM HTTP error", wasmRes.status, bodyPreview);
+    console.error(`${logTag} WASM HTTP error`, wasmRes.status, bodyPreview);
     throw new Error(
       `[SNARK WASM HTTP ${wasmRes.status}]\nURL: ${wasmUrl}\n` +
         `Body preview:\n${bodyPreview || "(empty)"}\n\nFile must exist under frontend/public/ and deploy with the app.`
@@ -104,7 +111,7 @@ async function verifySnarkArtifactsStepByStep() {
   }
 
   const wasmCt = wasmRes.headers.get("content-type") || "";
-  console.log("[deposit][snark] Step 2/5 OK: wasm response", {
+  console.log(`${logTag} Step 2/4 OK: wasm response`, {
     status: wasmRes.status,
     contentType: wasmCt,
   });
@@ -113,25 +120,25 @@ async function verifySnarkArtifactsStepByStep() {
   try {
     wasmBuffer = await wasmRes.arrayBuffer();
   } catch (e) {
-    console.error("[deposit][snark] WASM arrayBuffer failed:", e);
+    console.error(`${logTag} WASM arrayBuffer failed:`, e);
     throw new Error(
       `[SNARK WASM READ FAILED]\n${e?.message || e}\nURL was: ${wasmUrl}`
     );
   }
 
   const wasmBytes = new Uint8Array(wasmBuffer);
-  console.log("[deposit][snark] wasm byte length =", wasmBytes.byteLength);
+  console.log(`${logTag} wasm byte length =`, wasmBytes.byteLength);
 
   let zkeyRes;
   try {
-    console.log("[deposit][snark] Step 3/5: fetching zkey…");
+    console.log(`${logTag} Step 3/4: fetching zkey…`);
     zkeyRes = await fetch(zkeyUrl, {
       method: "GET",
       cache: "no-store",
       headers: { Accept: "application/octet-stream, */*" },
     });
   } catch (e) {
-    console.error("[deposit][snark] ZKEY fetch network error:", e);
+    console.error(`${logTag} ZKEY fetch network error:`, e);
     throw new Error(
       `[SNARK ZKEY FETCH FAILED — network/CORS]\nURL: ${zkeyUrl}\n${e?.message || e}`
     );
@@ -139,7 +146,7 @@ async function verifySnarkArtifactsStepByStep() {
 
   if (!zkeyRes.ok) {
     const preview = (await zkeyRes.text().catch(() => "")).slice(0, 500);
-    console.error("[deposit][snark] ZKEY HTTP error", zkeyRes.status, preview);
+    console.error(`${logTag} ZKEY HTTP error`, zkeyRes.status, preview);
     throw new Error(
       `[SNARK ZKEY HTTP ${zkeyRes.status}]\nURL: ${zkeyUrl}\n` +
         `Body preview:\n${preview || "(empty)"}`
@@ -147,7 +154,7 @@ async function verifySnarkArtifactsStepByStep() {
   }
 
   const zkeyCt = zkeyRes.headers.get("content-type") || "";
-  console.log("[deposit][snark] Step 3/5 OK: zkey response", {
+  console.log(`${logTag} Step 3/4 OK: zkey response`, {
     status: zkeyRes.status,
     contentType: zkeyCt,
   });
@@ -156,20 +163,20 @@ async function verifySnarkArtifactsStepByStep() {
   try {
     zkeyBuffer = await zkeyRes.arrayBuffer();
   } catch (e) {
-    console.error("[deposit][snark] ZKEY arrayBuffer failed:", e);
+    console.error(`${logTag} ZKEY arrayBuffer failed:`, e);
     throw new Error(`[SNARK ZKEY READ FAILED]\n${e?.message || e}`);
   }
 
   const zkeyBytes = new Uint8Array(zkeyBuffer);
-  console.log("[deposit][snark] zkey byte length =", zkeyBytes.byteLength);
+  console.log(`${logTag} zkey byte length =`, zkeyBytes.byteLength);
 
   let snarkjs;
   try {
-    console.log("[deposit][snark] Step 4/5: dynamic import('snarkjs')…");
+    console.log(`${logTag} Step 4/4: dynamic import('snarkjs')…`);
     snarkjs = await import("snarkjs");
-    console.log("[deposit][snark] Step 4/5 OK: snarkjs keys", Object.keys(snarkjs));
+    console.log(`${logTag} Step 4/4 OK: snarkjs loaded`);
   } catch (e) {
-    console.error("[deposit][snark] snarkjs import failed:", e);
+    console.error(`${logTag} snarkjs import failed:`, e);
     throw new Error(
       `[SNARKJS MODULE FAILED TO LOAD]\n${e?.message || e}\n${e?.stack || ""}`
     );
@@ -181,8 +188,20 @@ async function verifySnarkArtifactsStepByStep() {
     );
   }
 
+  return { wasmBytes, zkeyBytes, snarkjs };
+}
+
+/**
+ * Fetches proving artifacts and loads snarkjs so CORS/404/MIME issues surface as loud errors.
+ * Deposit also runs a null-input groth16 sanity throw (expected).
+ */
+async function verifySnarkArtifactsStepByStep() {
+  const { wasmBytes, zkeyBytes, snarkjs } = await loadGroth16Artifacts(
+    "[deposit][snark]"
+  );
+
   console.log(
-    "[deposit][snark] Step 5/5: groth16.fullProve in try/catch (invalid inputs — should reject quickly; deposit does not use a real witness)."
+    "[deposit][snark] Step 5/5: groth16.fullProve(null) sanity check (deposit does not use a witness)."
   );
   try {
     await withTimeout(
@@ -205,6 +224,63 @@ async function verifySnarkArtifactsStepByStep() {
   );
 
   return { wasmBytes, zkeyBytes, snarkjs };
+}
+
+/** `PoolPublicBind.circom` witness input — binding/diagnostic circuit (not a full privacy withdrawal). */
+const WITHDRAW_BINDING_CIRCUIT_INPUT = Object.freeze({
+  stateRoot: "0",
+  aspRoot: "0",
+  nullifierHash: "0",
+  recipient: "0",
+  relayer: "0",
+  fee: "0",
+});
+
+function proofToJsonSafe(proof) {
+  return JSON.parse(
+    JSON.stringify(proof, (_, v) => (typeof v === "bigint" ? v.toString() : v))
+  );
+}
+
+async function generateWithdrawBindingProof(wasmBytes, zkeyBytes, snarkjs) {
+  console.log(
+    "[withdraw][zk] groth16.fullProve starting (PoolPublicBind inputs:",
+    WITHDRAW_BINDING_CIRCUIT_INPUT,
+    ")"
+  );
+  const { proof, publicSignals } = await withTimeout(
+    snarkjs.groth16.fullProve(
+      { ...WITHDRAW_BINDING_CIRCUIT_INPUT },
+      wasmBytes,
+      zkeyBytes
+    ),
+    120_000,
+    "[withdraw][zk] groth16.fullProve"
+  );
+  console.log(
+    "[withdraw][zk] groth16.fullProve done; publicSignals count:",
+    publicSignals?.length
+  );
+  let solidityCalldata = null;
+  try {
+    if (typeof snarkjs.groth16?.exportSolidityCallData === "function") {
+      solidityCalldata = await snarkjs.groth16.exportSolidityCallData(
+        proof,
+        publicSignals
+      );
+      console.log(
+        "[withdraw][zk] exportSolidityCallData preview:",
+        String(solidityCalldata).slice(0, 120)
+      );
+    }
+  } catch (e) {
+    console.warn("[withdraw][zk] exportSolidityCallData:", e?.message || e);
+  }
+  return {
+    proofJson: proofToJsonSafe(proof),
+    publicSignals,
+    solidityCalldata,
+  };
 }
 
 function formatDepositFailure(step, e) {
@@ -785,7 +861,8 @@ function PoolCard() {
   const runConnect = useContext(ConnectFlowContext);
   const { address, isConnected } = useWagmiAccount();
   const [status, setStatus] = useState({ kind: "info", text: "Ready" });
-  const [busy, setBusy] = useState(false);
+  const [depositBusy, setDepositBusy] = useState(false);
+  const [withdrawBusy, setWithdrawBusy] = useState(false);
   const [burnerBusy, setBurnerBusy] = useState(false);
   const [burnerWallet, setBurnerWallet] = useState(null);
   const [token, setToken] = useState("ETH");
@@ -1019,7 +1096,7 @@ function PoolCard() {
     }
     if (!address) return;
 
-    setBusy(true);
+    setDepositBusy(true);
     const runId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     console.log(`[deposit] === start run ${runId} ===`);
 
@@ -1182,38 +1259,129 @@ function PoolCard() {
       console.error(`[deposit] === FAILED run ${runId} ===`, e);
       setStatus({ kind: "error", text: msg });
     } finally {
-      setBusy(false);
+      setDepositBusy(false);
     }
   }
 
   async function handleWithdraw() {
+    const wid = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    console.log("[withdraw] click → handleWithdraw()", wid, {
+      isConnected,
+      address: address || null,
+      depositBusy,
+      withdrawBusy,
+      token,
+      withdrawSpeed,
+      commitment: lastCommitment.current,
+    });
+
     if (!isConnected) {
+      console.log("[withdraw] not connected — opening wallet connect flow");
       try {
         await runConnect();
       } catch (e) {
-        // eslint-disable-next-line no-console
-        console.error("[connect]", e);
+        console.error("[withdraw] connect error", e);
       }
       return;
     }
-    setBusy(true);
-    setStatus({ kind: "info", text: "Requesting relayer-paid withdrawal…" });
+    if (!address) {
+      console.warn("[withdraw] abort: no address");
+      setStatus({ kind: "error", text: "No wallet address for withdrawal." });
+      return;
+    }
+
+    setWithdrawBusy(true);
+    setStatus({
+      kind: "info",
+      text: "Withdraw: loading ZK artifacts…",
+    });
+
     try {
-      const r = await postRelay({
+      console.log("[withdraw] Step 1: loadGroth16Artifacts");
+      const { wasmBytes, zkeyBytes, snarkjs } = await loadGroth16Artifacts(
+        "[withdraw][zk]"
+      );
+
+      setStatus({
+        kind: "info",
+        text: "Withdraw: generating Groth16 proof (binding circuit)…",
+      });
+      console.log("[withdraw] Step 2: generateWithdrawBindingProof");
+      let zkBundle = null;
+      try {
+        zkBundle = await generateWithdrawBindingProof(
+          wasmBytes,
+          zkeyBytes,
+          snarkjs
+        );
+        console.log("[withdraw] Step 2 OK: zkBundle keys:", zkBundle ? Object.keys(zkBundle) : "null");
+      } catch (zkErr) {
+        console.error("[withdraw] Step 2 ZK error (continuing without proof bundle):", zkErr);
+      }
+
+      console.log("[withdraw] Step 3: read protocol withdraw fee from pool (read-only RPC)");
+      const feeReader = new JsonRpcProvider(SEPOLIA_READ_RPC);
+      const poolRead = new Contract(POOL_ADDRESS, POOL_ABI, feeReader);
+      const feeBn =
+        token === "ETH"
+          ? await poolRead.PROTOCOL_WITHDRAW_FEE_ETH()
+          : await poolRead.PROTOCOL_WITHDRAW_FEE_USDT();
+      const feeStr = feeBn.toString();
+      console.log("[withdraw] fee (raw):", feeStr, token);
+
+      const ph32 = zeroPadValue("0x01", 32);
+      const relayBody = {
         action: "withdraw",
         recipient: address,
         commitment: lastCommitment.current ?? null,
         token,
         withdrawSpeed,
+        fee: feeStr,
+      };
+      if (zkBundle) {
+        relayBody.proof =
+          typeof zkBundle.solidityCalldata === "string"
+            ? zkBundle.solidityCalldata
+            : zkBundle.proofJson;
+        relayBody.publicSignals = JSON.parse(
+          JSON.stringify(zkBundle.publicSignals, (_, v) =>
+            typeof v === "bigint" ? v.toString() : v
+          )
+        );
+        relayBody.stateRoot = ph32;
+        relayBody.aspRoot = ph32;
+        relayBody.nullifierHash = ph32;
+        console.log("[withdraw] relay body includes proof (type:", typeof relayBody.proof, ")");
+      } else {
+        console.log("[withdraw] relay body: no ZK proof (relayer soft-accept path)");
+      }
+
+      setStatus({ kind: "info", text: "Withdraw: calling relayer…" });
+      console.log("[withdraw] Step 4: POST", `${RELAY_URL}/relay`, {
+        ...relayBody,
+        proof:
+          relayBody.proof != null
+            ? typeof relayBody.proof === "string"
+              ? `(string ${relayBody.proof.length} chars)`
+              : "(object)"
+            : "(none)",
       });
+
+      const r = await postRelay(relayBody);
+      console.log("[withdraw] Step 5 relayer JSON:", r);
       setStatus({
         kind: r?.success ? "success" : "error",
         text: r?.message || "Relayer responded.",
       });
     } catch (e) {
-      setStatus({ kind: "error", text: `Relay error: ${e.message}` });
+      console.error("[withdraw] FAILED", wid, e);
+      setStatus({
+        kind: "error",
+        text: `Withdraw failed: ${e?.message || e}`,
+      });
     } finally {
-      setBusy(false);
+      setWithdrawBusy(false);
+      console.log("[withdraw] done", wid);
     }
   }
 
@@ -1363,16 +1531,21 @@ function PoolCard() {
 
       <div style={styles.buttonRow}>
         <button
+          type="button"
           style={styles.primary}
           onClick={handleDeposit}
-          disabled={busy}
+          disabled={depositBusy || withdrawBusy}
         >
           {isConnected ? `Deposit ${depositLabel}` : "Connect & Deposit"}
         </button>
         <button
+          type="button"
           style={styles.secondary}
-          onClick={handleWithdraw}
-          disabled={busy}
+          onClick={() => {
+            console.log("[withdraw] button onClick fired");
+            void handleWithdraw();
+          }}
+          disabled={withdrawBusy || depositBusy}
         >
           Withdraw
         </button>
@@ -1382,7 +1555,7 @@ function PoolCard() {
         type="button"
         style={styles.ghostBtn}
         onClick={handleGenerateBurner}
-        disabled={busy || burnerBusy}
+        disabled={depositBusy || withdrawBusy || burnerBusy}
       >
         {burnerBusy ? "Generating…" : "Generate Burner Wallet"}
       </button>
