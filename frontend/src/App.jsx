@@ -848,10 +848,87 @@ function PoolCard() {
   async function ensureSepoliaSigner() {
     if (!wagmiConfig) throw new Error("Wallet not configured");
 
-    try {
-      await switchNetwork({ chainId: SEPOLIA_CHAIN_ID });
-    } catch {
-      /* already on Sepolia or pending */
+    /**
+     * `getWalletClient()` from wagmi/viem can hang indefinitely (no popup) for WalletConnect
+     * and some injected setups — it was tried FIRST here before, blocking Deposit for 180s.
+     * Prefer EIP-1193 via `connector.getProvider()` or real `window.ethereum` so MetaMask / WC
+     * actually receives `eth_sendTransaction` / chain switch.
+     */
+    async function requestSwitchToSepolia(eip1193) {
+      if (!eip1193?.request) return;
+      const chainIdHex = "0x" + SEPOLIA_CHAIN_ID.toString(16);
+      try {
+        await eip1193.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: chainIdHex }],
+        });
+      } catch (e) {
+        const code = e?.code;
+        if (code === 4902 || code === -32603) {
+          await eip1193.request({
+            method: "wallet_addEthereumChain",
+            params: [
+              {
+                chainId: chainIdHex,
+                chainName: "Sepolia",
+                nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                rpcUrls: [SEPOLIA_READ_RPC],
+                blockExplorerUrls: ["https://sepolia.etherscan.io"],
+              },
+            ],
+          });
+        } else {
+          throw new Error("Please switch your wallet to Sepolia.");
+        }
+      }
+    }
+
+    await withTimeout(
+      switchNetwork({ chainId: SEPOLIA_CHAIN_ID }).catch(() => {}),
+      25_000,
+      "wagmi switchNetwork(Sepolia)"
+    ).catch(() => {
+      console.warn(
+        "[ensureSepoliaSigner] switchNetwork timed out; trying direct EIP-1193 switch"
+      );
+    });
+
+    const connector = getAccount()?.connector;
+    if (connector && typeof connector.getProvider === "function") {
+      const raw = await connector.getProvider();
+      if (raw) {
+        const eip1193 = raw;
+        let provider = new BrowserProvider(eip1193);
+        let net = await provider.getNetwork();
+        if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
+          await requestSwitchToSepolia(eip1193);
+          provider = new BrowserProvider(eip1193);
+          net = await provider.getNetwork();
+          if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
+            throw new Error("Please switch your wallet to Sepolia.");
+          }
+        }
+        return provider.getSigner();
+      }
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      window.ethereum &&
+      !isInjectedEthereumStub()
+    ) {
+      const eip1193 = window.ethereum;
+      let provider = new BrowserProvider(eip1193);
+      let net = await provider.getNetwork();
+      if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
+        await requestSwitchToSepolia(eip1193);
+        provider = new BrowserProvider(eip1193);
+        net = await provider.getNetwork();
+        if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
+          throw new Error("Please switch your wallet to Sepolia.");
+        }
+      }
+      return provider.getSigner();
     }
 
     const walletClient =
@@ -871,26 +948,6 @@ function PoolCard() {
       const network = await provider.getNetwork();
       if (Number(network.chainId) !== SEPOLIA_CHAIN_ID) {
         throw new Error("Please switch your wallet to Sepolia.");
-      }
-      return provider.getSigner();
-    }
-
-    if (
-      typeof window !== "undefined" &&
-      window.ethereum &&
-      !isInjectedEthereumStub()
-    ) {
-      const provider = new BrowserProvider(window.ethereum);
-      const network = await provider.getNetwork();
-      if (Number(network.chainId) !== SEPOLIA_CHAIN_ID) {
-        try {
-          await window.ethereum.request({
-            method: "wallet_switchEthereumChain",
-            params: [{ chainId: "0x" + SEPOLIA_CHAIN_ID.toString(16) }],
-          });
-        } catch {
-          throw new Error("Please switch your wallet to Sepolia.");
-        }
       }
       return provider.getSigner();
     }
