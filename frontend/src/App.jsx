@@ -894,21 +894,69 @@ function PoolCard() {
     });
 
     const connector = getAccount()?.connector;
-    if (connector && typeof connector.getProvider === "function") {
-      const raw = await connector.getProvider();
-      if (raw) {
-        const eip1193 = raw;
-        let provider = new BrowserProvider(eip1193);
-        let net = await provider.getNetwork();
+    const connectorId = connector ? String(connector.id) : "";
+    /** WalletConnect must use the session provider; extension wallets hang on `getProvider()` in some builds. */
+    const useWalletConnectProvider = connectorId === "walletConnect";
+
+    async function signerFromEip1193(eip1193, label) {
+      console.log("[ensureSepoliaSigner]", label);
+      let provider = new BrowserProvider(eip1193);
+      let net = await withTimeout(
+        provider.getNetwork(),
+        20_000,
+        `${label}: provider.getNetwork()`
+      );
+      if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
+        await requestSwitchToSepolia(eip1193);
+        provider = new BrowserProvider(eip1193);
+        net = await withTimeout(
+          provider.getNetwork(),
+          20_000,
+          `${label}: getNetwork after switch`
+        );
         if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
-          await requestSwitchToSepolia(eip1193);
-          provider = new BrowserProvider(eip1193);
-          net = await provider.getNetwork();
-          if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
-            throw new Error("Please switch your wallet to Sepolia.");
-          }
+          throw new Error("Please switch your wallet to Sepolia.");
         }
-        return provider.getSigner();
+      }
+      return provider.getSigner();
+    }
+
+    if (
+      !useWalletConnectProvider &&
+      typeof window !== "undefined" &&
+      window.ethereum &&
+      !isInjectedEthereumStub()
+    ) {
+      try {
+        return await signerFromEip1193(
+          window.ethereum,
+          "using window.ethereum (MetaMask / injected — before connector.getProvider)"
+        );
+      } catch (e) {
+        console.warn("[ensureSepoliaSigner] window.ethereum path failed", e);
+      }
+    }
+
+    if (connector && typeof connector.getProvider === "function") {
+      let raw = null;
+      try {
+        console.log(
+          "[ensureSepoliaSigner] connector.getProvider()",
+          connectorId || "(no id)"
+        );
+        raw = await withTimeout(
+          connector.getProvider(),
+          15_000,
+          "connector.getProvider()"
+        );
+      } catch (e) {
+        console.warn(
+          "[ensureSepoliaSigner] connector.getProvider timed out or threw",
+          e?.message || e
+        );
+      }
+      if (raw) {
+        return await signerFromEip1193(raw, "using connector EIP-1193 provider");
       }
     }
 
@@ -917,24 +965,25 @@ function PoolCard() {
       window.ethereum &&
       !isInjectedEthereumStub()
     ) {
-      const eip1193 = window.ethereum;
-      let provider = new BrowserProvider(eip1193);
-      let net = await provider.getNetwork();
-      if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
-        await requestSwitchToSepolia(eip1193);
-        provider = new BrowserProvider(eip1193);
-        net = await provider.getNetwork();
-        if (Number(net.chainId) !== SEPOLIA_CHAIN_ID) {
-          throw new Error("Please switch your wallet to Sepolia.");
-        }
-      }
-      return provider.getSigner();
+      return await signerFromEip1193(
+        window.ethereum,
+        "fallback window.ethereum after connector failures"
+      );
     }
 
-    const walletClient =
-      (await getWalletClient({ chainId: SEPOLIA_CHAIN_ID }).catch(() =>
-        getWalletClient()
-      )) || null;
+    let walletClient = null;
+    try {
+      console.log("[ensureSepoliaSigner] trying getWalletClient (last resort)");
+      walletClient = await withTimeout(
+        getWalletClient({ chainId: SEPOLIA_CHAIN_ID }).catch(() =>
+          getWalletClient()
+        ),
+        15_000,
+        "getWalletClient()"
+      );
+    } catch (e) {
+      console.warn("[ensureSepoliaSigner] getWalletClient timed out", e?.message || e);
+    }
 
     if (walletClient) {
       const eip1193 = {
@@ -944,12 +993,7 @@ function PoolCard() {
             params: args.params ?? [],
           }),
       };
-      const provider = new BrowserProvider(eip1193);
-      const network = await provider.getNetwork();
-      if (Number(network.chainId) !== SEPOLIA_CHAIN_ID) {
-        throw new Error("Please switch your wallet to Sepolia.");
-      }
-      return provider.getSigner();
+      return await signerFromEip1193(eip1193, "via wagmi getWalletClient bridge");
     }
 
     throw new Error("No wallet provider available");
