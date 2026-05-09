@@ -10,6 +10,9 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 async function main() {
   const { ethers } = await network.connect();
   const [deployer] = await ethers.getSigners();
+  const useMockVerifier = String(process.env.USE_MOCK_VERIFIER || "")
+    .trim()
+    .toLowerCase() === "1";
 
   console.log("Deployer:", deployer.address);
   console.log(
@@ -23,17 +26,26 @@ async function main() {
   const usdtAddr = await usdt.getAddress();
   console.log("MockUSDT deployed to:                ", usdtAddr);
 
-  const groth16 = await ethers.deployContract("Groth16Verifier");
-  await groth16.waitForDeployment();
-  const groth16Addr = await groth16.getAddress();
-  console.log("Groth16Verifier deployed to:          ", groth16Addr);
+  let groth16Addr = null;
+  let verifierAddr;
+  if (useMockVerifier) {
+    const mockVerifier = await ethers.deployContract("MockVerifier");
+    await mockVerifier.waitForDeployment();
+    verifierAddr = await mockVerifier.getAddress();
+    console.log("MockVerifier deployed to:             ", verifierAddr);
+  } else {
+    const groth16 = await ethers.deployContract("Groth16Verifier");
+    await groth16.waitForDeployment();
+    groth16Addr = await groth16.getAddress();
+    console.log("Groth16Verifier deployed to:          ", groth16Addr);
 
-  const verifierAdapter = await ethers.deployContract("Groth16VerifierAdapter", [
-    groth16Addr,
-  ]);
-  await verifierAdapter.waitForDeployment();
-  const verifierAddr = await verifierAdapter.getAddress();
-  console.log("Groth16VerifierAdapter deployed to:   ", verifierAddr);
+    const verifierAdapter = await ethers.deployContract("Groth16VerifierAdapter", [
+      groth16Addr,
+    ]);
+    await verifierAdapter.waitForDeployment();
+    verifierAddr = await verifierAdapter.getAddress();
+    console.log("Groth16VerifierAdapter deployed to:   ", verifierAddr);
+  }
 
   const ethTree = await ethers.deployContract("MockIncrementalMerkleTree");
   await ethTree.waitForDeployment();
@@ -57,15 +69,25 @@ async function main() {
   const poolAddr = await pool.getAddress();
 
   console.log("TelegramPrivacyPool deployed to:      ", poolAddr);
+
+  const ASP_ROLE = await pool.ASP_ROLE();
+  await (await pool.grantRole(ASP_ROLE, deployer.address)).wait();
+  const aspBootstrapRoot = ethers.keccak256(
+    ethers.toUtf8Bytes("telegram-privacy-pool-asp-bootstrap-v1")
+  );
+  await (await pool.publishAspRoot(aspBootstrapRoot)).wait();
+  console.log("ASP_ROLE granted to deployer + initial ASP root published:", aspBootstrapRoot);
+
   console.log("\nSummary:");
   console.log(
     JSON.stringify(
       {
         network: "sepolia",
         deployer: deployer.address,
+        verifierMode: useMockVerifier ? "mock" : "groth16-adapter",
         mockUSDT: usdtAddr,
         groth16Verifier: groth16Addr,
-        groth16Adapter: verifierAddr,
+        verifier: verifierAddr,
         ethStateTree: ethTreeAddr,
         usdtStateTree: usdtTreeAddr,
         sanctionsOracle: ZERO_ADDRESS,

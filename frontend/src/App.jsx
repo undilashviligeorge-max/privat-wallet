@@ -9,13 +9,17 @@ import React, {
   useSyncExternalStore,
 } from "react";
 import {
+  AbiCoder,
   BrowserProvider,
   Contract,
   JsonRpcProvider,
   formatEther,
   formatUnits,
+  getAddress,
   MaxUint256,
-  zeroPadValue,
+  keccak256,
+  randomBytes,
+  ZeroHash,
 } from "ethers";
 import { w3mProvider } from "@web3modal/ethereum";
 import { WalletConnectConnector } from "@wagmi/core/connectors/walletConnect";
@@ -75,6 +79,21 @@ function withTimeout(promise, ms, label) {
  * Fetch wasm/zkey and load snarkjs (shared by deposit sanity check + withdraw proving).
  * @param {string} logTag e.g. "[deposit][snark]" or "[withdraw][zk]"
  */
+/** Dev: avoid stale wasm during iteration; prod: HTTP cache for faster repeat proves. */
+const ARTIFACT_FETCH_INIT = {
+  cache: import.meta.env.DEV ? "no-store" : "default",
+};
+
+/** One-time warm cache: artifact bytes + snarkjs module (withdraw + deposit share). */
+let groth16ArtifactCachePromise = null;
+
+function getGroth16ArtifactsCached(logTag) {
+  if (!groth16ArtifactCachePromise) {
+    groth16ArtifactCachePromise = loadGroth16Artifacts(logTag);
+  }
+  return groth16ArtifactCachePromise;
+}
+
 async function loadGroth16Artifacts(logTag) {
   const { wasmUrl, zkeyUrl } = circuitArtifactAbsoluteUrls();
 
@@ -90,7 +109,7 @@ async function loadGroth16Artifacts(logTag) {
     console.log(`${logTag} Step 2/4: fetching wasm…`);
     wasmRes = await fetch(wasmUrl, {
       method: "GET",
-      cache: "no-store",
+      ...ARTIFACT_FETCH_INIT,
       headers: { Accept: "application/wasm, application/octet-stream, */*" },
     });
   } catch (e) {
@@ -134,7 +153,7 @@ async function loadGroth16Artifacts(logTag) {
     console.log(`${logTag} Step 3/4: fetching zkey…`);
     zkeyRes = await fetch(zkeyUrl, {
       method: "GET",
-      cache: "no-store",
+      ...ARTIFACT_FETCH_INIT,
       headers: { Accept: "application/octet-stream, */*" },
     });
   } catch (e) {
@@ -196,7 +215,7 @@ async function loadGroth16Artifacts(logTag) {
  * Deposit also runs a null-input groth16 sanity throw (expected).
  */
 async function verifySnarkArtifactsStepByStep() {
-  const { wasmBytes, zkeyBytes, snarkjs } = await loadGroth16Artifacts(
+  const { wasmBytes, zkeyBytes, snarkjs } = await getGroth16ArtifactsCached(
     "[deposit][snark]"
   );
 
@@ -226,15 +245,27 @@ async function verifySnarkArtifactsStepByStep() {
   return { wasmBytes, zkeyBytes, snarkjs };
 }
 
-/** `PoolPublicBind.circom` witness input — binding/diagnostic circuit (not a full privacy withdrawal). */
-const WITHDRAW_BINDING_CIRCUIT_INPUT = Object.freeze({
-  stateRoot: "0",
-  aspRoot: "0",
-  nullifierHash: "0",
-  recipient: "0",
-  relayer: "0",
-  fee: "0",
-});
+/**
+ * `PoolPublicBind.circom` witness: decimal strings for field elements, aligned with
+ * `TelegramPrivacyPool.withdraw` publicInputs (roots/recipient/relayer/fee).
+ */
+function buildPoolPublicBindWitness({
+  stateRootHex,
+  aspRootHex,
+  nullifierHashHex,
+  recipientAddr,
+  relayerAddr,
+  feeStr,
+}) {
+  return {
+    stateRoot: BigInt(stateRootHex).toString(),
+    aspRoot: BigInt(aspRootHex).toString(),
+    nullifierHash: BigInt(nullifierHashHex).toString(),
+    recipient: BigInt(getAddress(recipientAddr)).toString(),
+    relayer: BigInt(getAddress(relayerAddr)).toString(),
+    fee: feeStr,
+  };
+}
 
 function proofToJsonSafe(proof) {
   return JSON.parse(
@@ -242,44 +273,126 @@ function proofToJsonSafe(proof) {
   );
 }
 
-async function generateWithdrawBindingProof(wasmBytes, zkeyBytes, snarkjs) {
+/**
+ * `Groth16VerifierAdapter` expects `abi.encode(uint256[2] a, uint256[2][2] b, uint256[2] c)` — not
+ * `groth16.exportSolidityCallData` text (that mixes in public inputs for a different Solidity API).
+ * Coordinate swap on `pi_b` matches snarkjs `exportSolidityCallData` / generated verifier layout.
+ */
+function encodeGroth16ProofBytes(proof) {
+  const pi_a = proof.pi_a ?? proof.piA;
+  const pi_b = proof.pi_b ?? proof.piB;
+  const pi_c = proof.pi_c ?? proof.piC;
+  if (!pi_a || !pi_b || !pi_c) {
+    throw new Error("Groth16 proof missing pi_a / pi_b / pi_c");
+  }
+  const a = [BigInt(pi_a[0]), BigInt(pi_a[1])];
+  const b = [
+    [BigInt(pi_b[0][1]), BigInt(pi_b[0][0])],
+    [BigInt(pi_b[1][1]), BigInt(pi_b[1][0])],
+  ];
+  const c = [BigInt(pi_c[0]), BigInt(pi_c[1])];
+  return AbiCoder.defaultAbiCoder().encode(
+    ["uint256[2]", "uint256[2][2]", "uint256[2]"],
+    [a, b, c]
+  );
+}
+
+/**
+ * Run Groth16 proving off the UI thread when possible (Telegram / mobile webviews often
+ * throttle a long main-thread WASM task so it looks “stuck”).
+ */
+async function groth16FullProveWorkerOrMain(witness, wasmBytes, zkeyBytes, timeoutMs) {
+  const labelWorker = "[withdraw][zk] groth16.fullProve (worker)";
+  const labelMain = "[withdraw][zk] groth16.fullProve (main thread)";
+
+  if (typeof Worker !== "undefined") {
+    try {
+      const { default: Groth16Worker } = await import(
+        "./groth16Prover.worker.js?worker"
+      );
+      const wasmCopy = wasmBytes.slice();
+      const zkeyCopy = zkeyBytes.slice();
+      let wRef;
+      const workerProve = new Promise((resolve, reject) => {
+        const w = new Groth16Worker();
+        wRef = w;
+        w.onmessage = (e) => {
+          try {
+            w.terminate();
+          } catch {
+            /* ignore */
+          }
+          wRef = undefined;
+          const { ok, proof, publicSignals, error } = e.data || {};
+          if (ok) resolve({ proof, publicSignals });
+          else reject(new Error(error || "Groth16 worker failed"));
+        };
+        w.onerror = (err) => {
+          try {
+            w.terminate();
+          } catch {
+            /* ignore */
+          }
+          wRef = undefined;
+          reject(err?.error || err);
+        };
+        w.postMessage(
+          {
+            witness,
+            wasmBuffer: wasmCopy.buffer,
+            zkeyBuffer: zkeyCopy.buffer,
+          },
+          [wasmCopy.buffer, zkeyCopy.buffer]
+        );
+      });
+      try {
+        return await withTimeout(workerProve, timeoutMs, labelWorker);
+      } catch (e) {
+        try {
+          wRef?.terminate();
+        } catch {
+          /* ignore */
+        }
+        throw e;
+      }
+    } catch (e) {
+      console.warn(
+        "[withdraw][zk] Worker proving unavailable, using main thread:",
+        e?.message || e
+      );
+    }
+  }
+
+  const snarkjs = await import("snarkjs");
+  return await withTimeout(
+    snarkjs.groth16.fullProve(witness, wasmBytes, zkeyBytes),
+    timeoutMs,
+    labelMain
+  );
+}
+
+async function generateWithdrawBindingProof(wasmBytes, zkeyBytes, witness) {
   console.log(
-    "[withdraw][zk] groth16.fullProve starting (PoolPublicBind inputs:",
-    WITHDRAW_BINDING_CIRCUIT_INPUT,
+    "[withdraw][zk] groth16.fullProve starting (PoolPublicBind witness keys:",
+    Object.keys(witness),
     ")"
   );
-  const { proof, publicSignals } = await withTimeout(
-    snarkjs.groth16.fullProve(
-      { ...WITHDRAW_BINDING_CIRCUIT_INPUT },
-      wasmBytes,
-      zkeyBytes
-    ),
-    120_000,
-    "[withdraw][zk] groth16.fullProve"
+  const { proof, publicSignals } = await groth16FullProveWorkerOrMain(
+    witness,
+    wasmBytes,
+    zkeyBytes,
+    300_000
   );
   console.log(
     "[withdraw][zk] groth16.fullProve done; publicSignals count:",
     publicSignals?.length
   );
-  let solidityCalldata = null;
-  try {
-    if (typeof snarkjs.groth16?.exportSolidityCallData === "function") {
-      solidityCalldata = await snarkjs.groth16.exportSolidityCallData(
-        proof,
-        publicSignals
-      );
-      console.log(
-        "[withdraw][zk] exportSolidityCallData preview:",
-        String(solidityCalldata).slice(0, 120)
-      );
-    }
-  } catch (e) {
-    console.warn("[withdraw][zk] exportSolidityCallData:", e?.message || e);
-  }
+  const proofHex = encodeGroth16ProofBytes(proof);
   return {
     proofJson: proofToJsonSafe(proof),
     publicSignals,
-    solidityCalldata,
+    solidityCalldata: null,
+    proofHex,
   };
 }
 
@@ -337,10 +450,10 @@ if (typeof window !== "undefined") {
 /** True only if a real `window.ethereum` existed before the shield stub (not the placeholder). */
 const isMetaMaskInstalled = hadRealEthereumBeforeShield;
 
-const POOL_ADDRESS = "0x84025852E750693826bC12596F1E917343CFdbAE";
+const POOL_ADDRESS = "0x292aC90176D227B301C80744f7D08985f49869dF";
 
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
-const MOCK_USDT_ADDRESS = "0x41DA8EaeC31F04bf29f1c30F046DD9A1Eef1218A";
+const MOCK_USDT_ADDRESS = "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
 
 /** Public HTTPS base URL for the relayer (Ngrok tunnel to localhost:3000). No trailing slash. */
 const RELAY_URL = String(
@@ -348,7 +461,9 @@ const RELAY_URL = String(
     import.meta.env &&
     import.meta.env.VITE_RELAY_URL) ||
     "https://dodge-reflex-hangnail.ngrok-free.dev"
-).trim();
+)
+  .trim()
+  .replace(/\/+$/, "");
 
 /** WalletConnect Cloud project id (required non-empty string for WalletConnect v2). */
 const WC_PROJECT_ID = (() => {
@@ -388,6 +503,16 @@ const POOL_ABI = [
   "function depositUsdt(bytes32 commitment)",
   "function usdt() view returns (address)",
   "function commitments(bytes32) view returns (bool)",
+  "function ethStateTree() view returns (address)",
+  "function usdtStateTree() view returns (address)",
+  "function aspRootIndex() view returns (uint32)",
+  "function aspRoots(uint256) view returns (bytes32)",
+  "function isKnownAspRoot(bytes32 root) view returns (bool)",
+  "event AspRootUpdated(bytes32 indexed root, uint32 index, address indexed asp)",
+];
+
+const MERKLE_TREE_ABI = [
+  "function currentRoot() view returns (bytes32)",
 ];
 
 const ERC20_ABI = [
@@ -396,6 +521,97 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)",
   "function balanceOf(address) view returns (uint256)",
 ];
+
+async function fetchRelayerWalletAddress() {
+  const envRaw =
+    typeof import.meta !== "undefined" &&
+    import.meta.env &&
+    import.meta.env.VITE_RELAYER_WALLET_ADDRESS
+      ? String(import.meta.env.VITE_RELAYER_WALLET_ADDRESS).trim()
+      : "";
+  if (envRaw && /^0x[a-fA-F0-9]{40}$/.test(envRaw)) {
+    return getAddress(envRaw);
+  }
+
+  const jsonHeaders = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    "ngrok-skip-browser-warning": "true",
+  };
+
+  const tryRelayerAddress = await fetch(`${RELAY_URL}/relayer-address`, {
+    method: "GET",
+    headers: jsonHeaders,
+  });
+  if (tryRelayerAddress.ok) {
+    const data = await tryRelayerAddress.json();
+    if (data?.address && typeof data.address === "string") {
+      return getAddress(data.address);
+    }
+  }
+
+  /** Older relayers or proxies that only expose POST /relay (no GET /relayer-address). */
+  const ping = await fetch(`${RELAY_URL}/relay`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ action: "ping" }),
+  });
+  if (!ping.ok) {
+    throw new Error(
+      `Relayer unreachable (/relayer-address ${tryRelayerAddress.status}, /relay ${ping.status}). Check VITE_RELAY_URL and that the relayer is running.`
+    );
+  }
+  const body = await ping.json();
+  const addr =
+    (typeof body?.relayerAddress === "string" && body.relayerAddress) ||
+    (typeof body?.address === "string" && body.address) ||
+    (typeof body?.relayer === "string" && body.relayer) ||
+    null;
+  if (!addr || !/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+    throw new Error(
+      "Relayer JSON missing relayerAddress (and no VITE_RELAYER_WALLET_ADDRESS). Set VITE_RELAYER_WALLET_ADDRESS in Vercel / .env.production, or redeploy backend/relayer.js and restart the relayer."
+    );
+  }
+  return getAddress(addr);
+}
+
+/**
+ * Latest ASP root that is still marked known on-chain (prefer `AspRootUpdated` logs;
+ * ring-buffer slot alone can be zero even after publishes in edge cases).
+ */
+async function fetchLatestKnownAspRoot(pool) {
+  try {
+    const filter = pool.filters.AspRootUpdated();
+    const logs = await pool.queryFilter(filter);
+    for (let i = logs.length - 1; i >= 0; i--) {
+      const root = logs[i].args?.root;
+      if (!root || root === ZeroHash) continue;
+      if (await pool.isKnownAspRoot(root)) return root;
+    }
+  } catch (e) {
+    console.warn("[withdraw][roots] AspRootUpdated query failed:", e?.message || e);
+  }
+  const idx = Number(await pool.aspRootIndex());
+  const slotRoot = await pool.aspRoots(idx);
+  if (slotRoot && slotRoot !== ZeroHash && (await pool.isKnownAspRoot(slotRoot))) {
+    return slotRoot;
+  }
+  return ZeroHash;
+}
+
+/** Current Merkle root + a known ASP root (required for `withdraw`). */
+async function fetchWithdrawRoots(assetToken) {
+  const provider = new JsonRpcProvider(SEPOLIA_READ_RPC);
+  const pool = new Contract(POOL_ADDRESS, POOL_ABI, provider);
+  const treeAddr =
+    assetToken === "ETH"
+      ? await pool.ethStateTree()
+      : await pool.usdtStateTree();
+  const tree = new Contract(treeAddr, MERKLE_TREE_ABI, provider);
+  const stateRoot = await tree.currentRoot();
+  const aspRoot = await fetchLatestKnownAspRoot(pool);
+  return { stateRoot, aspRoot };
+}
 
 /* ---------------------- wagmi (no @web3modal/react UI) ----------------------
  * We use WalletConnectConnector + optional InjectedConnector only.
@@ -451,7 +667,10 @@ function initWeb3Once() {
 }
 initWeb3Once();
 
-const ConnectFlowContext = createContext(() => Promise.resolve());
+const ConnectFlowContext = createContext({
+  runConnect: async () => {},
+  connectBusy: false,
+});
 
 /**
  * @param {(updater: { open: boolean; uri: string } | ((prev: { open: boolean; uri: string }) => { open: boolean; uri: string })) => void} setWcOverlay
@@ -562,13 +781,34 @@ const relayHeaders = {
   "ngrok-skip-browser-warning": "true",
 };
 
+function hintRelayerRpcPaymentError(msg) {
+  const s = typeof msg === "string" ? msg : String(msg || "");
+  if (/InvalidProof\(\)/i.test(s) || /\bInvalidProof\b/i.test(s)) {
+    return (
+      `${s} The relayer and RPC are healthy, but the generated zk proof does not match the deployed verifier. ` +
+      `This staging build uses a placeholder circuit; on-chain withdraw requires a proof generated from the exact circuit/verifier pair deployed in the pool.`
+    );
+  }
+  if (!/402|Payment Required/i.test(s)) return s;
+  return (
+    `${s} If this came from the relayer, its Ethereum RPC rejected the request (common: Tatum free tier). ` +
+    `Set SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com in the relayer .env and restart, or use a paid RPC.`
+  );
+}
+
 async function postRelay(body = {}) {
   const res = await fetch(`${RELAY_URL}/relay`, {
     method: "POST",
     headers: relayHeaders,
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Relay HTTP ${res.status}`);
+  if (!res.ok) {
+    const hint =
+      res.status === 402
+        ? " (ngrok or relay returned 402 — check tunnel billing or relayer RPC / Tatum plan.)"
+        : "";
+    throw new Error(`Relay HTTP ${res.status}${hint}`);
+  }
   return res.json();
 }
 
@@ -815,7 +1055,7 @@ function useWagmiAccount() {
 }
 
 function ConnectButton() {
-  const runConnect = useContext(ConnectFlowContext);
+  const { runConnect, connectBusy } = useContext(ConnectFlowContext);
   const { address, isConnected } = useWagmiAccount();
   const handleOpen = useCallback(async () => {
     try {
@@ -836,8 +1076,16 @@ function ConnectButton() {
 
   if (!isConnected) {
     return (
-      <button style={styles.connect} onClick={handleOpen}>
-        Connect Wallet
+      <button
+        style={{
+          ...styles.connect,
+          opacity: connectBusy ? 0.7 : 1,
+          cursor: connectBusy ? "not-allowed" : "pointer",
+        }}
+        onClick={handleOpen}
+        disabled={connectBusy}
+      >
+        {connectBusy ? "Connecting…" : "Connect Wallet"}
       </button>
     );
   }
@@ -858,7 +1106,7 @@ function ConnectButton() {
 }
 
 function PoolCard() {
-  const runConnect = useContext(ConnectFlowContext);
+  const { runConnect, connectBusy } = useContext(ConnectFlowContext);
   const { address, isConnected } = useWagmiAccount();
   const [status, setStatus] = useState({ kind: "info", text: "Ready" });
   const [depositBusy, setDepositBusy] = useState(false);
@@ -920,6 +1168,14 @@ function PoolCard() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    void getGroth16ArtifactsCached("[preload]")
+      .then(() => console.log("[preload] Groth16 wasm/zkey + snarkjs warmed"))
+      .catch((e) =>
+        console.warn("[preload] Groth16 warm skipped:", e?.message || e)
+      );
   }, []);
 
   async function ensureSepoliaSigner() {
@@ -1289,95 +1545,101 @@ function PoolCard() {
       setStatus({ kind: "error", text: "No wallet address for withdrawal." });
       return;
     }
+    const withdrawRecipient = burnerWallet?.address || address;
 
     setWithdrawBusy(true);
     setStatus({
       kind: "info",
-      text: "Withdraw: loading ZK artifacts…",
+      text: "Withdraw: loading artifacts and chain data…",
     });
 
     try {
-      console.log("[withdraw] Step 1: loadGroth16Artifacts");
-      const { wasmBytes, zkeyBytes, snarkjs } = await loadGroth16Artifacts(
-        "[withdraw][zk]"
-      );
+      const feeReader = new JsonRpcProvider(SEPOLIA_READ_RPC);
+      const poolRead = new Contract(POOL_ADDRESS, POOL_ABI, feeReader);
+
+      console.log("[withdraw] Step 1: parallel cache/relayer/fee/roots");
+      const [{ wasmBytes, zkeyBytes }, relayerWalletAddr, feeBn, roots] =
+        await Promise.all([
+          getGroth16ArtifactsCached("[withdraw][zk]"),
+          fetchRelayerWalletAddress(),
+          token === "ETH"
+            ? poolRead.PROTOCOL_WITHDRAW_FEE_ETH()
+            : poolRead.PROTOCOL_WITHDRAW_FEE_USDT(),
+          fetchWithdrawRoots(token),
+        ]);
+
+      const feeStr = feeBn.toString();
+      const { stateRoot, aspRoot } = roots;
+      if (aspRoot === ZeroHash || BigInt(aspRoot) === 0n) {
+        throw new Error(
+          "This pool has no ASP Merkle root on-chain yet (no publishAspRoot). " +
+            "Run once from repo root: npx hardhat run scripts/bootstrap-asp-root.js --network sepolia " +
+            "(uses PRIVATE_KEY pool admin in TelegramMixer/.env), then retry Withdraw."
+        );
+      }
+
+      const nullifierHash = keccak256(randomBytes(32));
+      const witness = buildPoolPublicBindWitness({
+        stateRootHex: stateRoot,
+        aspRootHex: aspRoot,
+        nullifierHashHex: nullifierHash,
+        recipientAddr: withdrawRecipient,
+        relayerAddr: relayerWalletAddr,
+        feeStr,
+      });
 
       setStatus({
         kind: "info",
-        text: "Withdraw: generating Groth16 proof (binding circuit)…",
+        text: `Withdraw: generating proof for ${shortAddr(
+          withdrawRecipient
+        )} (worker thread, often 30–120s)…`,
       });
       console.log("[withdraw] Step 2: generateWithdrawBindingProof");
-      let zkBundle = null;
-      try {
-        zkBundle = await generateWithdrawBindingProof(
-          wasmBytes,
-          zkeyBytes,
-          snarkjs
-        );
-        console.log("[withdraw] Step 2 OK: zkBundle keys:", zkBundle ? Object.keys(zkBundle) : "null");
-      } catch (zkErr) {
-        console.error("[withdraw] Step 2 ZK error (continuing without proof bundle):", zkErr);
-      }
+      const zkBundle = await generateWithdrawBindingProof(
+        wasmBytes,
+        zkeyBytes,
+        witness
+      );
+      console.log(
+        "[withdraw] Step 2 OK: proofHex length:",
+        zkBundle.proofHex?.length
+      );
 
-      console.log("[withdraw] Step 3: read protocol withdraw fee from pool (read-only RPC)");
-      const feeReader = new JsonRpcProvider(SEPOLIA_READ_RPC);
-      const poolRead = new Contract(POOL_ADDRESS, POOL_ABI, feeReader);
-      const feeBn =
-        token === "ETH"
-          ? await poolRead.PROTOCOL_WITHDRAW_FEE_ETH()
-          : await poolRead.PROTOCOL_WITHDRAW_FEE_USDT();
-      const feeStr = feeBn.toString();
-      console.log("[withdraw] fee (raw):", feeStr, token);
-
-      const ph32 = zeroPadValue("0x01", 32);
       const relayBody = {
         action: "withdraw",
-        recipient: address,
+        recipient: withdrawRecipient,
         commitment: lastCommitment.current ?? null,
         token,
         withdrawSpeed,
         fee: feeStr,
-      };
-      if (zkBundle) {
-        relayBody.proof =
-          typeof zkBundle.solidityCalldata === "string"
-            ? zkBundle.solidityCalldata
-            : zkBundle.proofJson;
-        relayBody.publicSignals = JSON.parse(
+        proof: zkBundle.proofHex,
+        publicSignals: JSON.parse(
           JSON.stringify(zkBundle.publicSignals, (_, v) =>
             typeof v === "bigint" ? v.toString() : v
           )
-        );
-        relayBody.stateRoot = ph32;
-        relayBody.aspRoot = ph32;
-        relayBody.nullifierHash = ph32;
-        console.log("[withdraw] relay body includes proof (type:", typeof relayBody.proof, ")");
-      } else {
-        console.log("[withdraw] relay body: no ZK proof (relayer soft-accept path)");
-      }
+        ),
+        stateRoot,
+        aspRoot,
+        nullifierHash,
+      };
 
       setStatus({ kind: "info", text: "Withdraw: calling relayer…" });
-      console.log("[withdraw] Step 4: POST", `${RELAY_URL}/relay`, {
+      console.log("[withdraw] Step 3 POST", `${RELAY_URL}/relay`, {
         ...relayBody,
-        proof:
-          relayBody.proof != null
-            ? typeof relayBody.proof === "string"
-              ? `(string ${relayBody.proof.length} chars)`
-              : "(object)"
-            : "(none)",
+        proof: `(hex ${relayBody.proof.length} chars)`,
       });
 
       const r = await postRelay(relayBody);
-      console.log("[withdraw] Step 5 relayer JSON:", r);
+      console.log("[withdraw] Step 4 relayer JSON:", r);
       setStatus({
         kind: r?.success ? "success" : "error",
-        text: r?.message || "Relayer responded.",
+        text: hintRelayerRpcPaymentError(r?.message || "Relayer responded."),
       });
     } catch (e) {
       console.error("[withdraw] FAILED", wid, e);
       setStatus({
         kind: "error",
-        text: `Withdraw failed: ${e?.message || e}`,
+        text: `Withdraw failed: ${hintRelayerRpcPaymentError(e?.message || e)}`,
       });
     } finally {
       setWithdrawBusy(false);
@@ -1394,11 +1656,14 @@ function PoolCard() {
     });
     try {
       const res = await fetch(`${RELAY_URL}/generate-burner`, {
-        method: "GET",
+        method: "POST",
+        cache: "no-store",
         headers: {
           Accept: "application/json",
+          "Content-Type": "application/json",
           "ngrok-skip-browser-warning": "true",
         },
+        body: JSON.stringify({ nonce: Date.now() }),
       });
       if (!res.ok) {
         throw new Error(`Relay HTTP ${res.status}`);
@@ -1534,9 +1799,13 @@ function PoolCard() {
           type="button"
           style={styles.primary}
           onClick={handleDeposit}
-          disabled={depositBusy || withdrawBusy}
+          disabled={depositBusy || withdrawBusy || connectBusy}
         >
-          {isConnected ? `Deposit ${depositLabel}` : "Connect & Deposit"}
+          {connectBusy
+            ? "Connecting Wallet…"
+            : isConnected
+            ? `Deposit ${depositLabel}`
+            : "Connect & Deposit"}
         </button>
         <button
           type="button"
@@ -1545,9 +1814,9 @@ function PoolCard() {
             console.log("[withdraw] button onClick fired");
             void handleWithdraw();
           }}
-          disabled={withdrawBusy || depositBusy}
+          disabled={withdrawBusy || depositBusy || connectBusy}
         >
-          Withdraw
+          {connectBusy ? "Connecting Wallet…" : "Withdraw"}
         </button>
       </div>
 
@@ -1555,7 +1824,7 @@ function PoolCard() {
         type="button"
         style={styles.ghostBtn}
         onClick={handleGenerateBurner}
-        disabled={depositBusy || withdrawBusy || burnerBusy}
+        disabled={depositBusy || withdrawBusy || burnerBusy || connectBusy}
       >
         {burnerBusy ? "Generating…" : "Generate Burner Wallet"}
       </button>
@@ -1676,9 +1945,18 @@ function WalletConnectOverlay({ open, uri, onCancel }) {
 
 export default function TelegramMixerApp() {
   const [wcOverlay, setWcOverlay] = useState({ open: false, uri: "" });
+  const [connectBusy, setConnectBusy] = useState(false);
   const runConnect = useCallback(
-    () => openConnectFlow(setWcOverlay),
-    []
+    async () => {
+      if (connectBusy) return;
+      setConnectBusy(true);
+      try {
+        await openConnectFlow(setWcOverlay);
+      } finally {
+        setConnectBusy(false);
+      }
+    },
+    [connectBusy]
   );
   // Hooks must run in the same order every render — declare them first,
   // then branch on init state.
@@ -1719,7 +1997,7 @@ export default function TelegramMixerApp() {
   }
 
   return (
-    <ConnectFlowContext.Provider value={runConnect}>
+    <ConnectFlowContext.Provider value={{ runConnect, connectBusy }}>
       <>
         <div style={styles.page}>
           {heading}

@@ -8,14 +8,23 @@ dotenv.config();
 /** Deployed TelegramPrivacyPool on Sepolia (override with POOL_ADDRESS in .env). */
 const POOL_ADDRESS =
   process.env.POOL_ADDRESS?.trim() ||
-  "0x84025852E750693826bC12596F1E917343CFdbAE";
+  "0x292aC90176D227B301C80744f7D08985f49869dF";
 
 /** Mock ERC20 USDT used by the pool on Sepolia (override with MOCK_USDT_ADDRESS in .env). */
 const MOCK_USDT_ADDRESS =
   process.env.MOCK_USDT_ADDRESS?.trim() ||
-  "0x41DA8EaeC31F04bf29f1c30F046DD9A1Eef1218A";
+  "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
 
 const POOL_ABI = [
+  "error NullifierAlreadyUsed()",
+  "error FeeExceedsDenomination()",
+  "error ZeroAddress()",
+  "error UnknownStateRoot()",
+  "error UnknownAspRoot()",
+  "error InvalidProof()",
+  "error EthTransferFailed()",
+  "error RecipientSanctioned(address)",
+  "error RelayerSanctioned(address)",
   "function withdraw(bytes proof, bytes32 stateRoot, bytes32 aspRoot, bytes32 nullifierHash, address payable recipient, address payable relayer, uint256 fee) external",
   "function withdrawUsdt(bytes proof, bytes32 stateRoot, bytes32 aspRoot, bytes32 nullifierHash, address recipient, address relayer, uint256 fee) external",
 ];
@@ -28,15 +37,50 @@ const WITHDRAW_QUEUE_TEST_MS = Object.freeze({
   "24h": 10_000,
 });
 
+/** Default when no paid RPC is configured; avoids Tatum gateway 402 on free tier writes. */
+const PUBLIC_SEPOLIA_RPC =
+  process.env.SEPOLIA_RPC_FALLBACK?.trim() ||
+  "https://ethereum-sepolia-rpc.publicnode.com";
+
+function sanitizeRpcUrl(raw) {
+  if (!raw) return "";
+  let v = String(raw).trim();
+  // Tolerate accidental markdown paste: [https://...] or (https://...)
+  if (
+    (v.startsWith("[") && v.endsWith("]")) ||
+    (v.startsWith("(") && v.endsWith(")"))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+  // Tolerate markdown link strings: [label](https://...)
+  const mdLink = v.match(/\((https?:\/\/[^)\s]+)\)\s*$/);
+  if (mdLink?.[1]) return mdLink[1].trim();
+  return v;
+}
+
 function createSepoliaProvider() {
-  const raw = process.env.TATUM_RPC_URL?.trim();
-  if (!raw) throw new Error("Missing TATUM_RPC_URL");
+  const sep = sanitizeRpcUrl(process.env.SEPOLIA_RPC_URL);
+  if (sep && (sep.startsWith("http://") || sep.startsWith("https://"))) {
+    return new ethers.JsonRpcProvider(sep);
+  }
+
+  const raw = sanitizeRpcUrl(process.env.TATUM_RPC_URL);
+  if (!raw) {
+    console.warn(
+      "[relayer] No TATUM_RPC_URL; using public Sepolia RPC. Set SEPOLIA_RPC_URL or TATUM_RPC_URL."
+    );
+    return new ethers.JsonRpcProvider(PUBLIC_SEPOLIA_RPC);
+  }
+
   if (raw.startsWith("http://") || raw.startsWith("https://")) {
     return new ethers.JsonRpcProvider(raw);
   }
-  const req = new ethers.FetchRequest("https://ethereum-sepolia.gateway.tatum.io/");
-  req.setHeader("x-api-key", raw);
-  return new ethers.JsonRpcProvider(req);
+
+  // Bare string = Tatum API key. Free gateway often returns HTTP 402 on eth_sendRawTransaction / eth_call.
+  console.warn(
+    "[relayer] TATUM_RPC_URL is an API key; using public Sepolia RPC for JSON-RPC (set SEPOLIA_RPC_URL=https://… for your own node)."
+  );
+  return new ethers.JsonRpcProvider(PUBLIC_SEPOLIA_RPC);
 }
 
 const provider = createSepoliaProvider();
@@ -55,7 +99,7 @@ app.use(
     allowedHeaders: ["Content-Type", "ngrok-skip-browser-warning"],
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: "4mb" }));
 
 function normalizeWithdrawSpeed(speed) {
   if (speed === "12h" || speed === "24h" || speed === "instant") return speed;
@@ -89,10 +133,20 @@ function hasFullZkBundle({
 
 function toProofBytes(proof) {
   if (typeof proof === "string") {
-    return proof.startsWith("0x") ? proof : `0x${proof}`;
+    const s = proof.trim();
+    if (s.startsWith("[")) {
+      throw new Error(
+        "proof must be ABI-encoded Groth16 bytes (0x hex), not snarkjs exportSolidityCallData bracket text"
+      );
+    }
+    const hex = s.startsWith("0x") ? s : `0x${s}`;
+    if (hex.length > 2 && !ethers.isHexString(hex)) {
+      throw new Error("proof is not valid hex");
+    }
+    return hex;
   }
   if (proof instanceof Uint8Array) return ethers.hexlify(proof);
-  return ethers.hexlify(proof);
+  throw new Error("Unsupported proof type (expected hex string or Uint8Array)");
 }
 
 function toBytes32(value, label) {
@@ -158,7 +212,7 @@ async function tryBroadcastWithdraw(p) {
       pool: POOL_ADDRESS,
     };
   } catch (e) {
-    const msg = e?.shortMessage || e?.reason || e?.message || String(e);
+    const msg = decodePoolError(pool.interface, e);
     console.error("[relayer] withdraw broadcast failed", msg);
     return {
       success: false,
@@ -168,6 +222,32 @@ async function tryBroadcastWithdraw(p) {
       mockUsdt: token === "USDT" ? MOCK_USDT_ADDRESS : undefined,
     };
   }
+}
+
+function decodePoolError(iface, err) {
+  const fallback = err?.shortMessage || err?.reason || err?.message || String(err);
+  const candidates = [
+    err?.data,
+    err?.error?.data,
+    err?.info?.error?.data,
+    err?.receipt?.revertReason,
+  ].filter((v) => typeof v === "string" && v.startsWith("0x"));
+
+  for (const data of candidates) {
+    try {
+      const parsed = iface.parseError(data);
+      if (!parsed) continue;
+      const args =
+        parsed.args && parsed.args.length
+          ? `(${parsed.args.map((x) => String(x)).join(", ")})`
+          : "()";
+      return `${parsed.name}${args}`;
+    } catch {
+      // keep trying other payload variants
+    }
+  }
+
+  return fallback;
 }
 
 async function handleWithdraw(req, res) {
@@ -265,13 +345,30 @@ async function handleWithdraw(req, res) {
   }
 }
 
-app.get("/generate-burner", (req, res) => {
+app.get("/relayer-address", async (_req, res) => {
+  try {
+    res.json({
+      success: true,
+      address: await relayerWallet.getAddress(),
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e?.message || String(e) });
+  }
+});
+
+function sendBurnerWallet(res) {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
   const w = ethers.Wallet.createRandom();
   res.json({
     address: w.address,
     privateKey: w.privateKey,
   });
-});
+}
+
+app.get("/generate-burner", (_req, res) => sendBurnerWallet(res));
+app.post("/generate-burner", (_req, res) => sendBurnerWallet(res));
 
 app.post("/withdraw", handleWithdraw);
 
@@ -284,6 +381,7 @@ app.post("/relay", async (req, res) => {
     message: "Relayer endpoint active",
     pool: POOL_ADDRESS,
     mockUsdt: MOCK_USDT_ADDRESS,
+    relayerAddress: await relayerWallet.getAddress(),
   });
 });
 

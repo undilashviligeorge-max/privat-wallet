@@ -4,11 +4,13 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node backend/relayer.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "build:circuit": "mkdir -p build/circuit && npx circom2 circuits/PoolPublicBind.circom --r1cs --wasm --sym -o build/circuit",
     "build:groth16": "npm run build:circuit && node scripts/build-groth16.mjs",
     "relayer": "node backend/relayer.js",
-    "tunnel": "ngrok http 3000"
+    "tunnel": "ngrok http 3000",
+    "bootstrap:asp": "hardhat run scripts/bootstrap-asp-root.js --network sepolia"
   },
   "keywords": [],
   "author": "",
