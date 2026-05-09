@@ -95,8 +95,9 @@ const app = express();
 app.use(
   cors({
     origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "ngrok-skip-browser-warning"],
+    methods: ["GET", "POST", "OPTIONS", "HEAD"],
+    allowedHeaders: ["Content-Type", "Authorization", "ngrok-skip-browser-warning"],
+    optionsSuccessStatus: 204,
   })
 );
 app.use(express.json({ limit: "4mb" }));
@@ -385,8 +386,9 @@ app.post("/relay", async (req, res) => {
   });
 });
 
-app.listen(3000, async () => {
-  console.log("Relayer is running on port 3000");
+const port = process.env.PORT || 3000;
+app.listen(port, async () => {
+  console.log(`Relayer is running on port ${port}`);
   console.log("Pool:", POOL_ADDRESS);
   console.log("Mock USDT:", MOCK_USDT_ADDRESS);
   console.log("Relayer wallet:", await relayerWallet.getAddress());
