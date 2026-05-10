@@ -522,57 +522,67 @@ const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
 ];
 
-async function fetchRelayerWalletAddress() {
-  const envRaw =
-    typeof import.meta !== "undefined" &&
-    import.meta.env &&
-    import.meta.env.VITE_RELAYER_WALLET_ADDRESS
-      ? String(import.meta.env.VITE_RELAYER_WALLET_ADDRESS).trim()
-      : "";
-  if (envRaw && /^0x[a-fA-F0-9]{40}$/.test(envRaw)) {
-    return getAddress(envRaw);
-  }
-
+/**
+ * ZK public inputs must match relayer fee + fee wallet from the server (`FEE_PERCENTAGE`, `FEE_WALLET_ADDRESS`).
+ */
+async function fetchFeeConfig() {
   const jsonHeaders = {
     Accept: "application/json",
     "Content-Type": "application/json",
     "ngrok-skip-browser-warning": "true",
   };
 
-  const tryRelayerAddress = await fetch(`${RELAY_URL}/relayer-address`, {
+  const tryFee = await fetch(`${RELAY_URL}/fee-config`, {
     method: "GET",
     headers: jsonHeaders,
   });
-  if (tryRelayerAddress.ok) {
-    const data = await tryRelayerAddress.json();
-    if (data?.address && typeof data.address === "string") {
-      return getAddress(data.address);
+  if (tryFee.ok) {
+    const d = await tryFee.json();
+    if (
+      d?.success &&
+      typeof d.feeWallet === "string" &&
+      typeof d.relayerFeeEth === "string" &&
+      typeof d.relayerFeeUsdt === "string"
+    ) {
+      return d;
     }
   }
 
-  /** Older relayers or proxies that only expose POST /relay (no GET /relayer-address). */
+  const tryRelayer = await fetch(`${RELAY_URL}/relayer-address`, {
+    method: "GET",
+    headers: jsonHeaders,
+  });
+  if (tryRelayer.ok) {
+    const d = await tryRelayer.json();
+    if (
+      d?.success &&
+      typeof d.feeWallet === "string" &&
+      typeof d.relayerFeeEth === "string" &&
+      typeof d.relayerFeeUsdt === "string"
+    ) {
+      return d;
+    }
+  }
+
   const ping = await fetch(`${RELAY_URL}/relay`, {
     method: "POST",
     headers: jsonHeaders,
     body: JSON.stringify({ action: "ping" }),
   });
-  if (!ping.ok) {
-    throw new Error(
-      `Relayer unreachable (/relayer-address ${tryRelayerAddress.status}, /relay ${ping.status}). Check VITE_RELAY_URL and that the relayer is running.`
-    );
+  if (ping.ok) {
+    const d = await ping.json();
+    if (
+      typeof d.feeWallet === "string" &&
+      typeof d.relayerFeeEth === "string" &&
+      typeof d.relayerFeeUsdt === "string"
+    ) {
+      return { success: true, ...d };
+    }
   }
-  const body = await ping.json();
-  const addr =
-    (typeof body?.relayerAddress === "string" && body.relayerAddress) ||
-    (typeof body?.address === "string" && body.address) ||
-    (typeof body?.relayer === "string" && body.relayer) ||
-    null;
-  if (!addr || !/^0x[a-fA-F0-9]{40}$/.test(addr)) {
-    throw new Error(
-      "Relayer JSON missing relayerAddress (and no VITE_RELAYER_WALLET_ADDRESS). Set VITE_RELAYER_WALLET_ADDRESS in Vercel / .env.production, or redeploy backend/relayer.js and restart the relayer."
-    );
-  }
-  return getAddress(addr);
+
+  throw new Error(
+    "Relayer missing fee config (GET /fee-config, /relayer-address, or POST /relay with fee fields). Redeploy backend/relayer.js."
+  );
 }
 
 /**
@@ -1554,21 +1564,16 @@ function PoolCard() {
     });
 
     try {
-      const feeReader = new JsonRpcProvider(SEPOLIA_READ_RPC);
-      const poolRead = new Contract(POOL_ADDRESS, POOL_ABI, feeReader);
+      console.log("[withdraw] Step 1: parallel cache/fee-config/roots");
+      const [{ wasmBytes, zkeyBytes }, feeConfig, roots] = await Promise.all([
+        getGroth16ArtifactsCached("[withdraw][zk]"),
+        fetchFeeConfig(),
+        fetchWithdrawRoots(token),
+      ]);
 
-      console.log("[withdraw] Step 1: parallel cache/relayer/fee/roots");
-      const [{ wasmBytes, zkeyBytes }, relayerWalletAddr, feeBn, roots] =
-        await Promise.all([
-          getGroth16ArtifactsCached("[withdraw][zk]"),
-          fetchRelayerWalletAddress(),
-          token === "ETH"
-            ? poolRead.PROTOCOL_WITHDRAW_FEE_ETH()
-            : poolRead.PROTOCOL_WITHDRAW_FEE_USDT(),
-          fetchWithdrawRoots(token),
-        ]);
-
-      const feeStr = feeBn.toString();
+      const feeStr =
+        token === "ETH" ? feeConfig.relayerFeeEth : feeConfig.relayerFeeUsdt;
+      const relayerForWitness = getAddress(feeConfig.feeWallet);
       const { stateRoot, aspRoot } = roots;
       if (aspRoot === ZeroHash || BigInt(aspRoot) === 0n) {
         throw new Error(
@@ -1584,7 +1589,7 @@ function PoolCard() {
         aspRootHex: aspRoot,
         nullifierHashHex: nullifierHash,
         recipientAddr: withdrawRecipient,
-        relayerAddr: relayerWalletAddr,
+        relayerAddr: relayerForWitness,
         feeStr,
       });
 

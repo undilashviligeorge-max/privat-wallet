@@ -15,6 +15,14 @@ const MOCK_USDT_ADDRESS =
   process.env.MOCK_USDT_ADDRESS?.trim() ||
   "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
 
+/** Must match `TelegramPrivacyPool` constants (used to compute relayer fee from FEE_PERCENTAGE). */
+const POOL_DENOMS = Object.freeze({
+  ETH_WEI: 10n ** 16n, // 0.01 ether
+  PROTOCOL_ETH_WEI: 10n ** 15n, // 0.001 ether
+  USDT: 100n * 1_000_000n, // 100 * 1e6
+  PROTOCOL_USDT: 1n * 1_000_000n, // 1 USDT (6 decimals)
+});
+
 const POOL_ABI = [
   "error NullifierAlreadyUsed()",
   "error FeeExceedsDenomination()",
@@ -89,6 +97,51 @@ const relayerWallet = new ethers.Wallet(
   pk?.startsWith("0x") ? pk : `0x${pk}`,
   provider
 );
+
+/** @returns {number} Percent 0–100 (e.g. 1 = 1%). Default 1. */
+function parseFeePercentage() {
+  const raw = process.env.FEE_PERCENTAGE?.trim();
+  if (!raw) return 1;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 100) return 1;
+  return n;
+}
+
+/** Basis points: 1% → 100 bps. */
+function feePercentToBps(percent) {
+  return BigInt(Math.min(10_000, Math.max(0, Math.round(percent * 100))));
+}
+
+/**
+ * Relayer fee = FEE_PERCENTAGE of (denomination − protocol fee), integer division.
+ * Matches funds the pool sends to the `relayer` argument after protocol fee is reserved.
+ */
+function computeRelayerFeeForToken(token, feePercentage = parseFeePercentage()) {
+  const bps = feePercentToBps(feePercentage);
+  if (token === "USDT") {
+    const net = POOL_DENOMS.USDT - POOL_DENOMS.PROTOCOL_USDT;
+    return (net * bps) / 10_000n;
+  }
+  const net = POOL_DENOMS.ETH_WEI - POOL_DENOMS.PROTOCOL_ETH_WEI;
+  return (net * bps) / 10_000n;
+}
+
+let cachedFeeWallet = null;
+async function resolveFeeWalletAddress() {
+  if (cachedFeeWallet) return cachedFeeWallet;
+  const raw = process.env.FEE_WALLET_ADDRESS?.trim();
+  if (raw) {
+    if (ethers.isAddress(raw)) {
+      cachedFeeWallet = ethers.getAddress(raw);
+      return cachedFeeWallet;
+    }
+    console.warn(
+      "[relayer] FEE_WALLET_ADDRESS is not a valid address; using relayer signer as fee wallet"
+    );
+  }
+  cachedFeeWallet = await relayerWallet.getAddress();
+  return cachedFeeWallet;
+}
 
 const app = express();
 
@@ -178,17 +231,41 @@ async function tryBroadcastWithdraw(p) {
   }
 
   const pool = new ethers.Contract(POOL_ADDRESS, POOL_ABI, relayerWallet);
-  const relayerAddr = await relayerWallet.getAddress();
+  const feeWallet = await resolveFeeWalletAddress();
+  const expectedRelayerFee = computeRelayerFeeForToken(token);
   const proofBytes = toProofBytes(proof);
   const sr = toBytes32(stateRoot, "stateRoot");
   const ar = toBytes32(aspRoot, "aspRoot");
   const nh = toBytes32(nullifierHash, "nullifierHash");
   const feeBn = typeof fee === "bigint" ? fee : BigInt(fee);
 
+  if (feeBn !== expectedRelayerFee) {
+    const msg = `Relayer fee mismatch: request has ${feeBn.toString()} but configured FEE_PERCENTAGE (${parseFeePercentage()}%) implies ${expectedRelayerFee.toString()} for ${token}. Use GET /fee-config and regenerate the ZK witness.`;
+    console.warn("[relayer]", msg);
+    return {
+      success: false,
+      message: msg,
+      token,
+      pool: POOL_ADDRESS,
+      mockUsdt: token === "USDT" ? MOCK_USDT_ADDRESS : undefined,
+      expectedRelayerFee: expectedRelayerFee.toString(),
+      feeWallet,
+    };
+  }
+
   try {
     if (token === "USDT") {
-      console.log("[relayer] Broadcasting withdrawUsdt → pool", POOL_ADDRESS, "MOCK_USDT", MOCK_USDT_ADDRESS);
-      const tx = await pool.withdrawUsdt(proofBytes, sr, ar, nh, recipient, relayerAddr, feeBn);
+      console.log(
+        "[relayer] Broadcasting withdrawUsdt → pool",
+        POOL_ADDRESS,
+        "MOCK_USDT",
+        MOCK_USDT_ADDRESS,
+        "feeWallet",
+        feeWallet,
+        "relayerFee",
+        feeBn.toString()
+      );
+      const tx = await pool.withdrawUsdt(proofBytes, sr, ar, nh, recipient, feeWallet, feeBn);
       const receipt = await tx.wait();
       console.log("[relayer] USDT withdrawal confirmed", receipt.hash);
       return {
@@ -201,8 +278,15 @@ async function tryBroadcastWithdraw(p) {
       };
     }
 
-    console.log("[relayer] Broadcasting withdraw (ETH) → pool", POOL_ADDRESS);
-    const tx = await pool.withdraw(proofBytes, sr, ar, nh, recipient, relayerAddr, feeBn);
+    console.log(
+      "[relayer] Broadcasting withdraw (ETH) → pool",
+      POOL_ADDRESS,
+      "feeWallet",
+      feeWallet,
+      "relayerFee",
+      feeBn.toString()
+    );
+    const tx = await pool.withdraw(proofBytes, sr, ar, nh, recipient, feeWallet, feeBn);
     const receipt = await tx.wait();
     console.log("[relayer] ETH withdrawal confirmed", receipt.hash);
     return {
@@ -348,9 +432,32 @@ async function handleWithdraw(req, res) {
 
 app.get("/relayer-address", async (_req, res) => {
   try {
+    const signer = await relayerWallet.getAddress();
     res.json({
       success: true,
-      address: await relayerWallet.getAddress(),
+      address: signer,
+      /** Receives on-chain relayer fee from the pool (ZK public input `relayer`). */
+      feeWallet: await resolveFeeWalletAddress(),
+      feePercentage: parseFeePercentage(),
+      relayerFeeEth: computeRelayerFeeForToken("ETH").toString(),
+      relayerFeeUsdt: computeRelayerFeeForToken("USDT").toString(),
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e?.message || String(e) });
+  }
+});
+
+app.get("/fee-config", async (_req, res) => {
+  try {
+    const signer = await relayerWallet.getAddress();
+    const pct = parseFeePercentage();
+    res.json({
+      success: true,
+      relayerSigner: signer,
+      feeWallet: await resolveFeeWalletAddress(),
+      feePercentage: pct,
+      relayerFeeEth: computeRelayerFeeForToken("ETH", pct).toString(),
+      relayerFeeUsdt: computeRelayerFeeForToken("USDT", pct).toString(),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e?.message || String(e) });
@@ -377,12 +484,18 @@ app.post("/relay", async (req, res) => {
   if (req.body && req.body.action === "withdraw") {
     return handleWithdraw(req, res);
   }
+  const signer = await relayerWallet.getAddress();
+  const pct = parseFeePercentage();
   res.json({
     success: true,
     message: "Relayer endpoint active",
     pool: POOL_ADDRESS,
     mockUsdt: MOCK_USDT_ADDRESS,
-    relayerAddress: await relayerWallet.getAddress(),
+    relayerAddress: signer,
+    feeWallet: await resolveFeeWalletAddress(),
+    feePercentage: pct,
+    relayerFeeEth: computeRelayerFeeForToken("ETH", pct).toString(),
+    relayerFeeUsdt: computeRelayerFeeForToken("USDT", pct).toString(),
   });
 });
 
@@ -391,5 +504,8 @@ app.listen(port, async () => {
   console.log(`Relayer is running on port ${port}`);
   console.log("Pool:", POOL_ADDRESS);
   console.log("Mock USDT:", MOCK_USDT_ADDRESS);
-  console.log("Relayer wallet:", await relayerWallet.getAddress());
+  const signer = await relayerWallet.getAddress();
+  console.log("Relayer wallet:", signer);
+  console.log("Fee wallet:", await resolveFeeWalletAddress());
+  console.log("FEE_PERCENTAGE:", parseFeePercentage(), "%");
 });
