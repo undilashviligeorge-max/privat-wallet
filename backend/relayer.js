@@ -98,32 +98,144 @@ const relayerWallet = new ethers.Wallet(
   provider
 );
 
-/** @returns {number} Percent 0–100 (e.g. 1 = 1%). Default 1. */
+/** @returns {number} Percent 0–100 (e.g. 0.1 = 0.1%). Default 0.1. */
 function parseFeePercentage() {
   const raw = process.env.FEE_PERCENTAGE?.trim();
-  if (!raw) return 1;
+  if (!raw) return 0.1;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0 || n > 100) return 1;
+  if (!Number.isFinite(n) || n < 0 || n > 100) return 0.1;
   return n;
 }
 
-/** Basis points: 1% → 100 bps. */
+/** Basis points: 1% → 100 bps, 0.1% → 10 bps. */
 function feePercentToBps(percent) {
   return BigInt(Math.min(10_000, Math.max(0, Math.round(percent * 100))));
 }
 
+function ceilDiv(a, b) {
+  if (b === 0n) return 0n;
+  return (a + b - 1n) / b;
+}
+
+/** Max pool payout to relayer + recipient slice (denomination − protocol fee). */
+function maxRelayerFeeForToken(token) {
+  if (token === "USDT") {
+    return POOL_DENOMS.USDT - POOL_DENOMS.PROTOCOL_USDT;
+  }
+  return POOL_DENOMS.ETH_WEI - POOL_DENOMS.PROTOCOL_ETH_WEI;
+}
+
 /**
- * Relayer fee = FEE_PERCENTAGE of (denomination − protocol fee), integer division.
- * Matches funds the pool sends to the `relayer` argument after protocol fee is reserved.
+ * Pure profit: FEE_PERCENTAGE of the full on-chain note size (gross denomination).
  */
-function computeRelayerFeeForToken(token, feePercentage = parseFeePercentage()) {
+function computeProfitFee(token, feePercentage = parseFeePercentage()) {
   const bps = feePercentToBps(feePercentage);
   if (token === "USDT") {
-    const net = POOL_DENOMS.USDT - POOL_DENOMS.PROTOCOL_USDT;
-    return (net * bps) / 10_000n;
+    return (POOL_DENOMS.USDT * bps) / 10_000n;
   }
-  const net = POOL_DENOMS.ETH_WEI - POOL_DENOMS.PROTOCOL_ETH_WEI;
-  return (net * bps) / 10_000n;
+  return (POOL_DENOMS.ETH_WEI * bps) / 10_000n;
+}
+
+/**
+ * USDT (6 decimals) atomic units per 1 ETH — for converting estimated gas (wei) into USDT.
+ * Example: 2500000000 = 2500 USDT per ETH.
+ */
+function parseUsdtPerEthAtomic() {
+  const raw = process.env.FEE_USDT_PER_ETH_USDT_ATOMIC?.trim();
+  if (raw) {
+    try {
+      return BigInt(raw);
+    } catch {
+      /* fall through */
+    }
+  }
+  return 2_500_000_000n;
+}
+
+/** Multiplier on gas cost in bps (10000 = 1.0). Default 11500 = +15% cushion. */
+function parseGasCostMultiplierBps() {
+  const raw = process.env.FEE_GAS_COST_MULT_BPS?.trim();
+  if (!raw) return 11_500n;
+  try {
+    const v = BigInt(raw);
+    return v < 10_000n ? 10_000n : v;
+  } catch {
+    return 11_500n;
+  }
+}
+
+function parseEstGasUnits(token) {
+  const key = token === "USDT" ? "FEE_EST_GAS_USDT" : "FEE_EST_GAS_ETH";
+  const def = token === "USDT" ? "400000" : "350000";
+  const raw = process.env[key]?.trim() || def;
+  try {
+    const g = BigInt(raw);
+    return g > 0n ? g : BigInt(def);
+  } catch {
+    return BigInt(def);
+  }
+}
+
+async function estimateWithdrawGasCostWei(token) {
+  const units = parseEstGasUnits(token);
+  let fd;
+  try {
+    fd = await provider.getFeeData();
+  } catch {
+    fd = {};
+  }
+  let wei = fd.maxFeePerGas ?? fd.gasPrice ?? 0n;
+  if (wei === 0n) {
+    const gwei = process.env.FEE_FALLBACK_GAS_PRICE_GWEI?.trim() || "30";
+    wei = ethers.parseUnits(gwei, "gwei");
+  }
+  const mult = parseGasCostMultiplierBps();
+  return ceilDiv(units * wei * mult, 10_000n);
+}
+
+/**
+ * Total relayer fee charged inside the pool: profit% of note + gas coverage (ETH path: extra wei; USDT path: USDT equivalent of gas).
+ * Capped so fee + protocol ≤ denomination (ZK + contract constraint).
+ */
+async function computeRelayerFeeDetails(token, feePercentage = parseFeePercentage()) {
+  const profit = computeProfitFee(token, feePercentage);
+  const gasWei = await estimateWithdrawGasCostWei(token);
+  let gasCoverageInToken;
+  let combined;
+  if (token === "USDT") {
+    const usdtPerEth = parseUsdtPerEthAtomic();
+    gasCoverageInToken = ceilDiv(gasWei * usdtPerEth, 10n ** 18n);
+    combined = profit + gasCoverageInToken;
+  } else {
+    gasCoverageInToken = gasWei;
+    combined = profit + gasWei;
+  }
+  const cap = maxRelayerFeeForToken(token);
+  const capped = combined > cap;
+  if (capped) {
+    console.warn("[relayer] relayer fee exceeds max allowed by pool; capping", {
+      token,
+      combined: combined.toString(),
+      cap: cap.toString(),
+    });
+  }
+  const total = capped ? cap : combined;
+  return {
+    total,
+    breakdown: {
+      profit: profit.toString(),
+      gasCoverage: gasCoverageInToken.toString(),
+      estimatedGasWei: gasWei.toString(),
+      total: total.toString(),
+      capped,
+      ...(capped ? { uncappedCombined: combined.toString() } : {}),
+    },
+  };
+}
+
+async function computeRelayerFeeForToken(token, feePercentage = parseFeePercentage()) {
+  const { total } = await computeRelayerFeeDetails(token, feePercentage);
+  return total;
 }
 
 let cachedFeeWallet = null;
@@ -232,7 +344,7 @@ async function tryBroadcastWithdraw(p) {
 
   const pool = new ethers.Contract(POOL_ADDRESS, POOL_ABI, relayerWallet);
   const feeWallet = await resolveFeeWalletAddress();
-  const expectedRelayerFee = computeRelayerFeeForToken(token);
+  const expectedRelayerFee = await computeRelayerFeeForToken(token);
   const proofBytes = toProofBytes(proof);
   const sr = toBytes32(stateRoot, "stateRoot");
   const ar = toBytes32(aspRoot, "aspRoot");
@@ -240,7 +352,7 @@ async function tryBroadcastWithdraw(p) {
   const feeBn = typeof fee === "bigint" ? fee : BigInt(fee);
 
   if (feeBn !== expectedRelayerFee) {
-    const msg = `Relayer fee mismatch: request has ${feeBn.toString()} but configured FEE_PERCENTAGE (${parseFeePercentage()}%) implies ${expectedRelayerFee.toString()} for ${token}. Use GET /fee-config and regenerate the ZK witness.`;
+    const msg = `Relayer fee mismatch: request has ${feeBn.toString()} but server expects ${expectedRelayerFee.toString()} for ${token} (${parseFeePercentage()}% profit on note + gas coverage; see GET /fee-config). Regenerate the ZK witness.`;
     console.warn("[relayer]", msg);
     return {
       success: false,
@@ -433,14 +545,19 @@ async function handleWithdraw(req, res) {
 app.get("/relayer-address", async (_req, res) => {
   try {
     const signer = await relayerWallet.getAddress();
+    const pct = parseFeePercentage();
+    const [relayerFeeEth, relayerFeeUsdt] = await Promise.all([
+      computeRelayerFeeForToken("ETH", pct),
+      computeRelayerFeeForToken("USDT", pct),
+    ]);
     res.json({
       success: true,
       address: signer,
       /** Receives on-chain relayer fee from the pool (ZK public input `relayer`). */
       feeWallet: await resolveFeeWalletAddress(),
-      feePercentage: parseFeePercentage(),
-      relayerFeeEth: computeRelayerFeeForToken("ETH").toString(),
-      relayerFeeUsdt: computeRelayerFeeForToken("USDT").toString(),
+      feePercentage: pct,
+      relayerFeeEth: relayerFeeEth.toString(),
+      relayerFeeUsdt: relayerFeeUsdt.toString(),
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e?.message || String(e) });
@@ -451,13 +568,19 @@ app.get("/fee-config", async (_req, res) => {
   try {
     const signer = await relayerWallet.getAddress();
     const pct = parseFeePercentage();
+    const [ethDetails, usdtDetails] = await Promise.all([
+      computeRelayerFeeDetails("ETH", pct),
+      computeRelayerFeeDetails("USDT", pct),
+    ]);
     res.json({
       success: true,
       relayerSigner: signer,
       feeWallet: await resolveFeeWalletAddress(),
       feePercentage: pct,
-      relayerFeeEth: computeRelayerFeeForToken("ETH", pct).toString(),
-      relayerFeeUsdt: computeRelayerFeeForToken("USDT", pct).toString(),
+      relayerFeeEth: ethDetails.total.toString(),
+      relayerFeeUsdt: usdtDetails.total.toString(),
+      breakdownEth: ethDetails.breakdown,
+      breakdownUsdt: usdtDetails.breakdown,
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e?.message || String(e) });
@@ -486,6 +609,10 @@ app.post("/relay", async (req, res) => {
   }
   const signer = await relayerWallet.getAddress();
   const pct = parseFeePercentage();
+  const [relayerFeeEth, relayerFeeUsdt] = await Promise.all([
+    computeRelayerFeeForToken("ETH", pct),
+    computeRelayerFeeForToken("USDT", pct),
+  ]);
   res.json({
     success: true,
     message: "Relayer endpoint active",
@@ -494,8 +621,8 @@ app.post("/relay", async (req, res) => {
     relayerAddress: signer,
     feeWallet: await resolveFeeWalletAddress(),
     feePercentage: pct,
-    relayerFeeEth: computeRelayerFeeForToken("ETH", pct).toString(),
-    relayerFeeUsdt: computeRelayerFeeForToken("USDT", pct).toString(),
+    relayerFeeEth: relayerFeeEth.toString(),
+    relayerFeeUsdt: relayerFeeUsdt.toString(),
   });
 });
 
@@ -507,5 +634,16 @@ app.listen(port, async () => {
   const signer = await relayerWallet.getAddress();
   console.log("Relayer wallet:", signer);
   console.log("Fee wallet:", await resolveFeeWalletAddress());
-  console.log("FEE_PERCENTAGE:", parseFeePercentage(), "%");
+  const pct = parseFeePercentage();
+  console.log("FEE_PERCENTAGE:", pct, "% (profit on note; plus gas coverage in fee)");
+  try {
+    const [fEth, fUsdt] = await Promise.all([
+      computeRelayerFeeForToken("ETH", pct),
+      computeRelayerFeeForToken("USDT", pct),
+    ]);
+    console.log("Sample relayer fee ETH wei:", fEth.toString());
+    console.log("Sample relayer fee USDT atomic:", fUsdt.toString());
+  } catch (e) {
+    console.warn("[relayer] could not precompute fees:", e?.message || e);
+  }
 });
