@@ -709,7 +709,7 @@ app.post("/relay", async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
+const port = parseInt(process.env.PORT, 10) || 3000;
 app.use((err, _req, res, _next) => {
   console.error("[relayer] unhandled express error", err);
   if (res.headersSent) return;
