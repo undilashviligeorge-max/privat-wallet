@@ -465,6 +465,12 @@ const RELAY_URL = String(
   .trim()
   .replace(/\/+$/, "");
 
+function buildRelayUrl(path) {
+  const base = RELAY_URL.replace(/\/+$/, "");
+  const cleanPath = String(path || "").replace(/^\/+/, "");
+  return `${base}/${cleanPath}`;
+}
+
 /** WalletConnect Cloud project id (required non-empty string for WalletConnect v2). */
 const WC_PROJECT_ID = (() => {
   const id = String(
@@ -532,7 +538,7 @@ async function fetchFeeConfig() {
     "ngrok-skip-browser-warning": "true",
   };
 
-  const tryFee = await fetch(`${RELAY_URL}/fee-config`, {
+  const tryFee = await fetch(buildRelayUrl("/fee-config"), {
     method: "GET",
     headers: jsonHeaders,
   });
@@ -548,7 +554,7 @@ async function fetchFeeConfig() {
     }
   }
 
-  const tryRelayer = await fetch(`${RELAY_URL}/relayer-address`, {
+  const tryRelayer = await fetch(buildRelayUrl("/relayer-address"), {
     method: "GET",
     headers: jsonHeaders,
   });
@@ -564,7 +570,7 @@ async function fetchFeeConfig() {
     }
   }
 
-  const ping = await fetch(`${RELAY_URL}/relay`, {
+  const ping = await fetch(buildRelayUrl("/relay"), {
     method: "POST",
     headers: jsonHeaders,
     body: JSON.stringify({ action: "ping" }),
@@ -807,7 +813,7 @@ function hintRelayerRpcPaymentError(msg) {
 }
 
 async function postRelay(body = {}) {
-  const res = await fetch(`${RELAY_URL}/relay`, {
+  const res = await fetch(buildRelayUrl("/relay"), {
     method: "POST",
     headers: relayHeaders,
     body: JSON.stringify(body),
@@ -1629,7 +1635,7 @@ function PoolCard() {
       };
 
       setStatus({ kind: "info", text: "Withdraw: calling relayer…" });
-      console.log("[withdraw] Step 3 POST", `${RELAY_URL}/relay`, {
+      console.log("[withdraw] Step 3 POST", buildRelayUrl("/relay"), {
         ...relayBody,
         proof: `(hex ${relayBody.proof.length} chars)`,
       });
@@ -1660,7 +1666,7 @@ function PoolCard() {
       text: "Requesting burner wallet from relayer…",
     });
     try {
-      const res = await fetch(`${RELAY_URL}/generate-burner`, {
+      const res = await fetch(buildRelayUrl("/generate-burner"), {
         method: "POST",
         cache: "no-store",
         headers: {

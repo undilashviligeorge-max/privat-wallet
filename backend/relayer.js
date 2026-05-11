@@ -5,6 +5,35 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+const FRONTEND_ORIGIN = "https://frontend-two-rho-69.vercel.app";
+const LOCAL_ORIGIN_REGEX = /^https?:\/\/localhost(?::\d+)?$/i;
+const RELAYER_HOST = "0.0.0.0";
+
+const startupDiagnostics = {
+  warnings: [],
+  errors: [],
+};
+
+function addStartupWarning(msg) {
+  startupDiagnostics.warnings.push(msg);
+  console.warn(`[relayer][startup] ${msg}`);
+}
+
+function addStartupError(msg) {
+  startupDiagnostics.errors.push(msg);
+  console.error(`[relayer][startup] ${msg}`);
+}
+
+function envFirst(...keys) {
+  for (const key of keys) {
+    const value = process.env[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
 /** Deployed TelegramPrivacyPool on Sepolia (override with POOL_ADDRESS in .env). */
 const POOL_ADDRESS =
   process.env.POOL_ADDRESS?.trim() ||
@@ -67,7 +96,7 @@ function sanitizeRpcUrl(raw) {
 }
 
 function createSepoliaProvider() {
-  const sep = sanitizeRpcUrl(process.env.SEPOLIA_RPC_URL);
+  const sep = sanitizeRpcUrl(envFirst("RPC_URL_SEPOLIA", "SEPOLIA_RPC_URL"));
   if (sep && (sep.startsWith("http://") || sep.startsWith("https://"))) {
     return new ethers.JsonRpcProvider(sep);
   }
@@ -93,10 +122,16 @@ function createSepoliaProvider() {
 
 const provider = createSepoliaProvider();
 const pk = process.env.PRIVATE_KEY?.trim();
-const relayerWallet = new ethers.Wallet(
-  pk?.startsWith("0x") ? pk : `0x${pk}`,
-  provider
-);
+let relayerWallet = null;
+if (!pk) {
+  addStartupError("Missing PRIVATE_KEY; withdrawal broadcasting is disabled.");
+} else {
+  try {
+    relayerWallet = new ethers.Wallet(pk.startsWith("0x") ? pk : `0x${pk}`, provider);
+  } catch (e) {
+    addStartupError(`Invalid PRIVATE_KEY format; withdrawal broadcasting is disabled. ${e?.message || e}`);
+  }
+}
 
 /** @returns {number} Percent 0–100 (e.g. 0.1 = 0.1%). Default 0.1. */
 function parseFeePercentage() {
@@ -251,6 +286,11 @@ async function resolveFeeWalletAddress() {
       "[relayer] FEE_WALLET_ADDRESS is not a valid address; using relayer signer as fee wallet"
     );
   }
+  if (!relayerWallet) {
+    throw new Error(
+      "FEE_WALLET_ADDRESS is missing/invalid and relayer signer is unavailable (check PRIVATE_KEY)"
+    );
+  }
   cachedFeeWallet = await relayerWallet.getAddress();
   return cachedFeeWallet;
 }
@@ -259,13 +299,48 @@ const app = express();
 
 app.use(
   cors({
-    origin: "*",
+    origin(origin, cb) {
+      if (!origin) return cb(null, true);
+      if (origin === FRONTEND_ORIGIN || LOCAL_ORIGIN_REGEX.test(origin)) {
+        return cb(null, true);
+      }
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
     methods: ["GET", "POST", "OPTIONS", "HEAD"],
-    allowedHeaders: ["Content-Type", "Authorization", "ngrok-skip-browser-warning"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Accept",
+      "Origin",
+      "X-Requested-With",
+      "ngrok-skip-browser-warning",
+    ],
+    credentials: false,
     optionsSuccessStatus: 204,
   })
 );
 app.use(express.json({ limit: "4mb" }));
+
+app.get("/", (_req, res) => {
+  res.send("Relayer is alive and running!");
+});
+
+function relayerNotReadyPayload() {
+  return {
+    success: false,
+    message:
+      "Relayer started in degraded mode. Check Railway logs for missing/invalid environment variables.",
+    diagnostics: startupDiagnostics,
+  };
+}
+
+function ensureRelayerReady(res) {
+  if (relayerWallet) return true;
+  if (res) {
+    res.status(503).json(relayerNotReadyPayload());
+  }
+  return false;
+}
 
 function normalizeWithdrawSpeed(speed) {
   if (speed === "12h" || speed === "24h" || speed === "instant") return speed;
@@ -543,6 +618,7 @@ async function handleWithdraw(req, res) {
 }
 
 app.get("/relayer-address", async (_req, res) => {
+  if (!ensureRelayerReady(res)) return;
   try {
     const signer = await relayerWallet.getAddress();
     const pct = parseFeePercentage();
@@ -565,6 +641,7 @@ app.get("/relayer-address", async (_req, res) => {
 });
 
 app.get("/fee-config", async (_req, res) => {
+  if (!ensureRelayerReady(res)) return;
   try {
     const signer = await relayerWallet.getAddress();
     const pct = parseFeePercentage();
@@ -604,46 +681,96 @@ app.post("/generate-burner", (_req, res) => sendBurnerWallet(res));
 app.post("/withdraw", handleWithdraw);
 
 app.post("/relay", async (req, res) => {
-  if (req.body && req.body.action === "withdraw") {
-    return handleWithdraw(req, res);
-  }
-  const signer = await relayerWallet.getAddress();
-  const pct = parseFeePercentage();
-  const [relayerFeeEth, relayerFeeUsdt] = await Promise.all([
-    computeRelayerFeeForToken("ETH", pct),
-    computeRelayerFeeForToken("USDT", pct),
-  ]);
-  res.json({
-    success: true,
-    message: "Relayer endpoint active",
-    pool: POOL_ADDRESS,
-    mockUsdt: MOCK_USDT_ADDRESS,
-    relayerAddress: signer,
-    feeWallet: await resolveFeeWalletAddress(),
-    feePercentage: pct,
-    relayerFeeEth: relayerFeeEth.toString(),
-    relayerFeeUsdt: relayerFeeUsdt.toString(),
-  });
-});
-
-const port = process.env.PORT || 3000;
-app.listen(port, async () => {
-  console.log(`Relayer is running on port ${port}`);
-  console.log("Pool:", POOL_ADDRESS);
-  console.log("Mock USDT:", MOCK_USDT_ADDRESS);
-  const signer = await relayerWallet.getAddress();
-  console.log("Relayer wallet:", signer);
-  console.log("Fee wallet:", await resolveFeeWalletAddress());
-  const pct = parseFeePercentage();
-  console.log("FEE_PERCENTAGE:", pct, "% (profit on note; plus gas coverage in fee)");
+  if (!ensureRelayerReady(res)) return;
   try {
-    const [fEth, fUsdt] = await Promise.all([
+    if (req.body && req.body.action === "withdraw") {
+      return handleWithdraw(req, res);
+    }
+    const signer = await relayerWallet.getAddress();
+    const pct = parseFeePercentage();
+    const [relayerFeeEth, relayerFeeUsdt] = await Promise.all([
       computeRelayerFeeForToken("ETH", pct),
       computeRelayerFeeForToken("USDT", pct),
     ]);
-    console.log("Sample relayer fee ETH wei:", fEth.toString());
-    console.log("Sample relayer fee USDT atomic:", fUsdt.toString());
+    res.json({
+      success: true,
+      message: "Relayer endpoint active",
+      pool: POOL_ADDRESS,
+      mockUsdt: MOCK_USDT_ADDRESS,
+      relayerAddress: signer,
+      feeWallet: await resolveFeeWalletAddress(),
+      feePercentage: pct,
+      relayerFeeEth: relayerFeeEth.toString(),
+      relayerFeeUsdt: relayerFeeUsdt.toString(),
+    });
   } catch (e) {
-    console.warn("[relayer] could not precompute fees:", e?.message || e);
+    console.error("[relayer] /relay error", e);
+    res.status(500).json({ success: false, message: e?.message || String(e) });
   }
 });
+
+const port = process.env.PORT || 3000;
+app.use((err, _req, res, _next) => {
+  console.error("[relayer] unhandled express error", err);
+  if (res.headersSent) return;
+  res.status(500).json({ success: false, message: "Internal server error" });
+});
+
+async function logStartupDetails() {
+  console.log("Pool:", POOL_ADDRESS);
+  console.log("Mock USDT:", MOCK_USDT_ADDRESS);
+  console.log("Allowed CORS origin:", FRONTEND_ORIGIN);
+  if (relayerWallet) {
+    const signer = await relayerWallet.getAddress();
+    console.log("Relayer wallet:", signer);
+  } else {
+    addStartupWarning("Relayer signer unavailable; only health checks and diagnostics routes should be used.");
+  }
+  try {
+    console.log("Fee wallet:", await resolveFeeWalletAddress());
+  } catch (e) {
+    addStartupError(e?.message || String(e));
+  }
+  const pct = parseFeePercentage();
+  console.log("FEE_PERCENTAGE:", pct, "% (profit on note; plus gas coverage in fee)");
+  if (relayerWallet) {
+    try {
+      const [fEth, fUsdt] = await Promise.all([
+        computeRelayerFeeForToken("ETH", pct),
+        computeRelayerFeeForToken("USDT", pct),
+      ]);
+      console.log("Sample relayer fee ETH wei:", fEth.toString());
+      console.log("Sample relayer fee USDT atomic:", fUsdt.toString());
+    } catch (e) {
+      console.warn("[relayer] could not precompute fees:", e?.message || e);
+    }
+  }
+  if (startupDiagnostics.errors.length > 0) {
+    console.error("[relayer] startup diagnostics errors:", startupDiagnostics.errors);
+  }
+  if (startupDiagnostics.warnings.length > 0) {
+    console.warn("[relayer] startup diagnostics warnings:", startupDiagnostics.warnings);
+  }
+}
+
+async function startServer() {
+  try {
+    app.listen(port, RELAYER_HOST, async () => {
+      console.log(`Relayer is running on ${RELAYER_HOST}:${port}`);
+      await logStartupDetails();
+    });
+  } catch (e) {
+    console.error("[relayer] failed to start server", e);
+    process.exitCode = 1;
+  }
+}
+
+process.on("uncaughtException", (err) => {
+  console.error("[relayer] uncaughtException", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[relayer] unhandledRejection", reason);
+});
+
+startServer();
