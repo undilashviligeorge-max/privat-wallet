@@ -5,7 +5,9 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const FRONTEND_ORIGIN = "https://frontend-two-rho-69.vercel.app";
+const FRONTEND_ORIGIN =
+  process.env.FRONTEND_ORIGIN?.trim() ||
+  "https://frontend-two-rho-69.vercel.app";
 const LOCAL_ORIGIN_REGEX = /^https?:\/\/localhost(?::\d+)?$/i;
 const RELAYER_HOST = "0.0.0.0";
 

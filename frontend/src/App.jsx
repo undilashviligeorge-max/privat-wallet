@@ -455,12 +455,12 @@ const POOL_ADDRESS = "0x292aC90176D227B301C80744f7D08985f49869dF";
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
 const MOCK_USDT_ADDRESS = "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
 
-/** Public HTTPS base URL for the relayer (Ngrok tunnel to localhost:3000). No trailing slash. */
+/** Public HTTPS base URL for the relayer (Railway in prod; override with VITE_RELAY_URL). No trailing slash. */
 const RELAY_URL = String(
   (typeof import.meta !== "undefined" &&
     import.meta.env &&
     import.meta.env.VITE_RELAY_URL) ||
-    "https://dodge-reflex-hangnail.ngrok-free.dev"
+    "https://privat-wallet-production.up.railway.app"
 )
   .trim()
   .replace(/\/+$/, "");
