@@ -540,6 +540,7 @@ async function fetchFeeConfig() {
 
   const tryFee = await fetch(buildRelayUrl("/fee-config"), {
     method: "GET",
+    cache: "no-store",
     headers: jsonHeaders,
   });
   if (tryFee.ok) {
@@ -556,6 +557,7 @@ async function fetchFeeConfig() {
 
   const tryRelayer = await fetch(buildRelayUrl("/relayer-address"), {
     method: "GET",
+    cache: "no-store",
     headers: jsonHeaders,
   });
   if (tryRelayer.ok) {
@@ -572,6 +574,7 @@ async function fetchFeeConfig() {
 
   const ping = await fetch(buildRelayUrl("/relay"), {
     method: "POST",
+    cache: "no-store",
     headers: jsonHeaders,
     body: JSON.stringify({ action: "ping" }),
   });
@@ -1570,15 +1573,15 @@ function PoolCard() {
     });
 
     try {
-      console.log("[withdraw] Step 1: parallel cache/fee-config/roots");
-      const [{ wasmBytes, zkeyBytes }, feeConfig, roots] = await Promise.all([
+      console.log("[withdraw] Step 1: loading artifacts + roots");
+      const [{ wasmBytes, zkeyBytes }, roots] = await Promise.all([
         getGroth16ArtifactsCached("[withdraw][zk]"),
-        fetchFeeConfig(),
         fetchWithdrawRoots(token),
       ]);
 
-      const feeStr =
-        token === "ETH" ? feeConfig.relayerFeeEth : feeConfig.relayerFeeUsdt;
+      // Fetch fee config immediately before witness/proof generation so we
+      // bind to the relayer's latest expected fee.
+      const feeConfig = await fetchFeeConfig();
       const relayerForWitness = getAddress(feeConfig.feeWallet);
       const { stateRoot, aspRoot } = roots;
       if (aspRoot === ZeroHash || BigInt(aspRoot) === 0n) {
@@ -1590,57 +1593,85 @@ function PoolCard() {
       }
 
       const nullifierHash = keccak256(randomBytes(32));
-      const witness = buildPoolPublicBindWitness({
-        stateRootHex: stateRoot,
-        aspRootHex: aspRoot,
-        nullifierHashHex: nullifierHash,
-        recipientAddr: withdrawRecipient,
-        relayerAddr: relayerForWitness,
-        feeStr,
-      });
+      async function buildProofAndRelay(feeStrToUse) {
+        const witness = buildPoolPublicBindWitness({
+          stateRootHex: stateRoot,
+          aspRootHex: aspRoot,
+          nullifierHashHex: nullifierHash,
+          recipientAddr: withdrawRecipient,
+          relayerAddr: relayerForWitness,
+          feeStr: feeStrToUse,
+        });
 
-      setStatus({
-        kind: "info",
-        text: `Withdraw: generating proof for ${shortAddr(
-          withdrawRecipient
-        )} (worker thread, often 30–120s)…`,
-      });
-      console.log("[withdraw] Step 2: generateWithdrawBindingProof");
-      const zkBundle = await generateWithdrawBindingProof(
-        wasmBytes,
-        zkeyBytes,
-        witness
-      );
-      console.log(
-        "[withdraw] Step 2 OK: proofHex length:",
-        zkBundle.proofHex?.length
-      );
+        setStatus({
+          kind: "info",
+          text: `Withdraw: generating proof for ${shortAddr(
+            withdrawRecipient
+          )} (worker thread, often 30–120s)…`,
+        });
+        console.log("[withdraw] Step 2: generateWithdrawBindingProof", {
+          feeStr: feeStrToUse,
+        });
+        const zkBundle = await generateWithdrawBindingProof(
+          wasmBytes,
+          zkeyBytes,
+          witness
+        );
+        console.log(
+          "[withdraw] Step 2 OK: proofHex length:",
+          zkBundle.proofHex?.length
+        );
 
-      const relayBody = {
-        action: "withdraw",
-        recipient: withdrawRecipient,
-        commitment: lastCommitment.current ?? null,
-        token,
-        withdrawSpeed,
-        fee: feeStr,
-        proof: zkBundle.proofHex,
-        publicSignals: JSON.parse(
-          JSON.stringify(zkBundle.publicSignals, (_, v) =>
-            typeof v === "bigint" ? v.toString() : v
-          )
-        ),
-        stateRoot,
-        aspRoot,
-        nullifierHash,
-      };
+        const relayBody = {
+          action: "withdraw",
+          recipient: withdrawRecipient,
+          commitment: lastCommitment.current ?? null,
+          token,
+          withdrawSpeed,
+          fee: feeStrToUse,
+          proof: zkBundle.proofHex,
+          publicSignals: JSON.parse(
+            JSON.stringify(zkBundle.publicSignals, (_, v) =>
+              typeof v === "bigint" ? v.toString() : v
+            )
+          ),
+          stateRoot,
+          aspRoot,
+          nullifierHash,
+        };
 
-      setStatus({ kind: "info", text: "Withdraw: calling relayer…" });
-      console.log("[withdraw] Step 3 POST", buildRelayUrl("/relay"), {
-        ...relayBody,
-        proof: `(hex ${relayBody.proof.length} chars)`,
-      });
+        setStatus({ kind: "info", text: "Withdraw: calling relayer…" });
+        console.log("[withdraw] Step 3 POST", buildRelayUrl("/relay"), {
+          ...relayBody,
+          proof: `(hex ${relayBody.proof.length} chars)`,
+        });
 
-      const r = await postRelay(relayBody);
+        return postRelay(relayBody);
+      }
+
+      const initialFeeStr =
+        token === "ETH" ? feeConfig.relayerFeeEth : feeConfig.relayerFeeUsdt;
+      let r = await buildProofAndRelay(initialFeeStr);
+
+      // Gas can move while proving; if relayer reports the exact expected fee,
+      // regenerate witness/proof once with that fee and retry automatically.
+      if (
+        !r?.success &&
+        typeof r?.expectedRelayerFee === "string" &&
+        r.expectedRelayerFee !== initialFeeStr &&
+        /Relayer fee mismatch/i.test(String(r?.message || ""))
+      ) {
+        console.warn("[withdraw] fee mismatch, regenerating proof once", {
+          initialFeeStr,
+          expectedRelayerFee: r.expectedRelayerFee,
+        });
+        setStatus({
+          kind: "info",
+          text: "Relayer fee changed while proving; regenerating proof with exact fee…",
+        });
+        r = await buildProofAndRelay(r.expectedRelayerFee);
+      }
+
       console.log("[withdraw] Step 4 relayer JSON:", r);
       setStatus({
         kind: r?.success ? "success" : "error",
