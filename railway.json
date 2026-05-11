@@ -1,5 +1,5 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
-  "build": { "watchPatterns": ["backend/**"] },
-  "deploy": { "startCommand": "node backend/relayer.js" }
+  "build": { "watchPatterns": ["backend/**", "package.json", "package-lock.json", "railway.json", "relayer.js"] },
+  "deploy": { "startCommand": "node relayer.js" }
 }
