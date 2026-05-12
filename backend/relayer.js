@@ -631,7 +631,7 @@ async function handleWithdraw(req, res) {
 
     if (delayMs === 0) {
       console.log(
-        `[relayer] Instant ${token} withdraw for ${recipientNorm} (commitment=${commitment ?? "n/a"})`
+        `[relayer] Instant ${token} withdraw for ${recipientNorm} sender=${senderNorm} (commitment=${commitment ?? "n/a"})`
       );
       const result = await tryBroadcastWithdraw(payload);
       const softReady =
@@ -659,12 +659,12 @@ async function handleWithdraw(req, res) {
 
     const humanLabel = withdrawSpeed === "12h" ? "12 hours" : "24 hours";
     console.log(
-      `[relayer] Queued ${token} withdrawal for ${recipientNorm} — withdrawSpeed=${withdrawSpeed} (${humanLabel} SLA; test timer ${delayMs}ms)`
+      `[relayer] Queued ${token} withdrawal for ${recipientNorm} sender=${senderNorm} — withdrawSpeed=${withdrawSpeed} (${humanLabel} SLA; test timer ${delayMs}ms)`
     );
 
     setTimeout(() => {
       console.log(
-        `[relayer] Executing queued ${withdrawSpeed} withdrawal for ${recipientNorm} (${token})`
+        `[relayer] Executing queued ${withdrawSpeed} withdrawal for ${recipientNorm} sender=${senderNorm} (${token})`
       );
       tryBroadcastWithdraw(payload).catch((err) =>
         console.error("[relayer] queued withdraw runner error", err)
