@@ -450,10 +450,10 @@ if (typeof window !== "undefined") {
 /** True only if a real `window.ethereum` existed before the shield stub (not the placeholder). */
 const isMetaMaskInstalled = hadRealEthereumBeforeShield;
 
-const POOL_ADDRESS = "0x292aC90176D227B301C80744f7D08985f49869dF";
+const POOL_ADDRESS = "0xdF91714EAC240b6c5AA652669f11Ef1776BbB2a9";
 
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
-const MOCK_USDT_ADDRESS = "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
+const MOCK_USDT_ADDRESS = "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
 
 /** Production relayer on Railway (HTTPS). Never use ngrok here — override only with `VITE_RELAY_URL`. */
 const DEFAULT_RELAYER_URL = "https://privat-wallet-production.up.railway.app";

@@ -1,6 +1,6 @@
 import { network } from "hardhat";
 
-const DEFAULT_MOCK_USDT = "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
+const DEFAULT_MOCK_USDT = "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
 const MINT_UNITS = 10_000n * 10n ** 6n; // 10,000 USDT with 6 decimals
 
 async function main() {

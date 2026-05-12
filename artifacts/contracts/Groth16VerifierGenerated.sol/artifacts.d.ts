@@ -15,7 +15,7 @@ export interface Groth16Verifier$Type {
   readonly deployedLinkReferences: {};
   readonly immutableReferences: {};
   readonly inputSourceName: "project/contracts/Groth16VerifierGenerated.sol";
-  readonly buildInfoId: "solc-0_8_24-3f05c15533e1d9f31ac703256c1c8be0b76b50de";
+  readonly buildInfoId: "solc-0_8_24-c03e0d314aca855dcb91bf1118567b1856bae4ec";
 };
 
 import "hardhat/types/artifacts";

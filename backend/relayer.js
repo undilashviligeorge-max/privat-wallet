@@ -36,12 +36,12 @@ function envFirst(...keys) {
 /** Deployed TelegramPrivacyPool on Sepolia (override with POOL_ADDRESS in .env). */
 const POOL_ADDRESS =
   process.env.POOL_ADDRESS?.trim() ||
-  "0x292aC90176D227B301C80744f7D08985f49869dF";
+  "0xdF91714EAC240b6c5AA652669f11Ef1776BbB2a9";
 
 /** Mock ERC20 USDT used by the pool on Sepolia (override with MOCK_USDT_ADDRESS in .env). */
 const MOCK_USDT_ADDRESS =
   process.env.MOCK_USDT_ADDRESS?.trim() ||
-  "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
+  "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
 
 /** Must match `TelegramPrivacyPool` constants (used to compute relayer fee from FEE_PERCENTAGE). */
 const POOL_DENOMS = Object.freeze({

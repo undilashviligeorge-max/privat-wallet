@@ -70,7 +70,8 @@ async function main() {
 
   console.log("TelegramPrivacyPool deployed to:      ", poolAddr);
 
-  const ASP_ROLE = await pool.ASP_ROLE();
+  // Use literal role hash so deploy works on RPCs that block eth_call (e.g. some Tatum tiers).
+  const ASP_ROLE = ethers.keccak256(ethers.toUtf8Bytes("ASP_ROLE"));
   await (await pool.grantRole(ASP_ROLE, deployer.address)).wait();
   const aspBootstrapRoot = ethers.keccak256(
     ethers.toUtf8Bytes("telegram-privacy-pool-asp-bootstrap-v1")
