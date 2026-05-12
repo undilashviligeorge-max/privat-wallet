@@ -885,20 +885,84 @@ function hintRelayerRpcPaymentError(msg) {
   );
 }
 
+/**
+ * Walk fetch/ethers-style errors so the UI shows the decoded relayer or RPC message,
+ * not only "Relay HTTP 500" / generic revert text.
+ */
+function extractWithdrawFailureDetail(err) {
+  if (err == null) return "Unknown error";
+  const parts = [];
+  const seen = new Set();
+  const push = (s) => {
+    if (typeof s !== "string" || !s.trim()) return;
+    const t = s.trim();
+    if (seen.has(t)) return;
+    seen.add(t);
+    parts.push(t);
+  };
+  const visit = (e, depth) => {
+    if (e == null || depth > 6) return;
+    if (typeof e === "string") {
+      push(e);
+      return;
+    }
+    push(e.message);
+    push(e.shortMessage);
+    push(e.reason);
+    const data = e.data ?? e.error?.data;
+    if (typeof data === "string" && data.startsWith("0x")) {
+      push(`revertData: ${data.slice(0, 200)}${data.length > 200 ? "…" : ""}`);
+    }
+    const body = e.response?.data;
+    if (body != null) {
+      if (typeof body === "string") push(body.slice(0, 800));
+      else {
+        push(body.error);
+        push(body.message);
+      }
+    }
+    if (e.cause) visit(e.cause, depth + 1);
+  };
+  visit(err, 0);
+  return parts.length ? parts.join(" — ") : String(err);
+}
+
 async function postRelay(body = {}) {
   const res = await relayFetch("/relay", {
     method: "POST",
     headers: relayHeaders,
     body: JSON.stringify(body),
   });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    /* non-JSON body */
+  }
   if (!res.ok) {
     const hint =
       res.status === 402
         ? " (ngrok or relay returned 402 — check tunnel billing or relayer RPC / Tatum plan.)"
         : "";
-    throw new Error(`Relay HTTP ${res.status}${hint}`);
+    const fromJson =
+      (data && (data.message || data.error)) ||
+      (typeof data === "string" ? data : null);
+    const detail =
+      (typeof fromJson === "string" && fromJson ? fromJson : null) ||
+      (text && text.length < 1200 ? text : "");
+    throw new Error(
+      detail
+        ? `Relay HTTP ${res.status}: ${detailtrim(detail)}${hint}`
+        : `Relay HTTP ${res.status}${hint}`
+    );
   }
-  return res.json();
+  return data;
+}
+
+function detailtrim(s) {
+  const t = String(s).replace(/\s+/g, " ").trim();
+  return t.length > 2000 ? `${t.slice(0, 2000)}…` : t;
 }
 
 /** 32 random bytes as a 0x-prefixed hex string. */
@@ -1949,17 +2013,28 @@ function PoolCard() {
       }
 
       console.log("[withdraw] Step 4 relayer JSON:", r);
+      const relayerMeta = [];
+      if (r?.pool) relayerMeta.push(`pool=${r.pool}`);
+      if (r?.mockUsdt) relayerMeta.push(`mockUsdt=${r.mockUsdt}`);
+      if (r?.expectedRelayerFee != null)
+        relayerMeta.push(`expectedRelayerFee=${r.expectedRelayerFee}`);
+      const relayerMsg = r?.message || "Relayer responded.";
+      const relayerFull =
+        relayerMeta.length && !r?.success
+          ? `${relayerMsg} [${relayerMeta.join(", ")}]`
+          : relayerMsg;
       setStatus({
         kind: r?.success ? "success" : "error",
-        text: hintRelayerRpcPaymentError(r?.message || "Relayer responded."),
+        text: hintRelayerRpcPaymentError(relayerFull),
       });
       setShowAddUsdtAfterWithdraw(Boolean(r?.success && token === "USDT"));
     } catch (e) {
       console.error("[withdraw] FAILED", wid, e);
       setShowAddUsdtAfterWithdraw(false);
+      const detail = extractWithdrawFailureDetail(e);
       setStatus({
         kind: "error",
-        text: `Withdraw failed: ${hintRelayerRpcPaymentError(e?.message || e)}`,
+        text: `Withdraw failed: ${hintRelayerRpcPaymentError(detail)}`,
       });
     } finally {
       setWithdrawBusy(false);
