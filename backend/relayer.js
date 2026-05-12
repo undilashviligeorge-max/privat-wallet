@@ -5,10 +5,7 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const FRONTEND_ORIGIN =
-  process.env.FRONTEND_ORIGIN?.trim() ||
-  "https://frontend-two-rho-69.vercel.app";
-const LOCAL_ORIGIN_REGEX = /^https?:\/\/localhost(?::\d+)?$/i;
+/** Listen on all interfaces (Railway / Docker). */
 const RELAYER_HOST = "0.0.0.0";
 
 const startupDiagnostics = {
@@ -299,15 +296,10 @@ async function resolveFeeWalletAddress() {
 
 const app = express();
 
+/** Reflect browser Origin (`credentials: false`) — works for every Vercel URL without maintaining an allowlist. */
 app.use(
   cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true);
-      if (origin === FRONTEND_ORIGIN || LOCAL_ORIGIN_REGEX.test(origin)) {
-        return cb(null, true);
-      }
-      return cb(new Error(`CORS blocked for origin: ${origin}`));
-    },
+    origin: true,
     methods: ["GET", "POST", "OPTIONS", "HEAD"],
     allowedHeaders: [
       "Content-Type",
@@ -721,7 +713,7 @@ app.use((err, _req, res, _next) => {
 async function logStartupDetails() {
   console.log("Pool:", POOL_ADDRESS);
   console.log("Mock USDT:", MOCK_USDT_ADDRESS);
-  console.log("Allowed CORS origin:", FRONTEND_ORIGIN);
+  console.log("CORS: permissive (reflect request Origin; credentials=false)");
   if (relayerWallet) {
     const signer = await relayerWallet.getAddress();
     console.log("Relayer wallet:", signer);

@@ -455,12 +455,15 @@ const POOL_ADDRESS = "0x292aC90176D227B301C80744f7D08985f49869dF";
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
 const MOCK_USDT_ADDRESS = "0x0E6De97eC3dD98D1e0605B527110c5C19d85d29e";
 
-/** Public HTTPS base URL for the relayer (Railway in prod; override with VITE_RELAY_URL). No trailing slash. */
+/** Production relayer on Railway (HTTPS). Never use ngrok here — override only with `VITE_RELAY_URL`. */
+const DEFAULT_RELAYER_URL = "https://privat-wallet-production.up.railway.app";
+
+/** Public HTTPS base URL for the relayer. No trailing slash. */
 const RELAY_URL = String(
   (typeof import.meta !== "undefined" &&
     import.meta.env &&
     import.meta.env.VITE_RELAY_URL) ||
-    "https://privat-wallet-production.up.railway.app"
+    DEFAULT_RELAYER_URL
 )
   .trim()
   .replace(/\/+$/, "");
@@ -469,6 +472,36 @@ function buildRelayUrl(path) {
   const base = RELAY_URL.replace(/\/+$/, "");
   const cleanPath = String(path || "").replace(/^\/+/, "");
   return `${base}/${cleanPath}`;
+}
+
+/**
+ * All browser → relayer traffic goes through here: consistent cache bust + actionable errors if TLS/DNS/CORS fails.
+ */
+async function relayFetch(path, init = {}) {
+  const url = buildRelayUrl(path);
+  const baseHeaders = {
+    Accept: "application/json",
+    "ngrok-skip-browser-warning": "true",
+  };
+  const merged = {
+    cache: "no-store",
+    ...init,
+    headers: { ...baseHeaders, ...(init.headers || {}) },
+  };
+  try {
+    return await fetch(url, merged);
+  } catch (e) {
+    const name = e?.name || "";
+    const msg = e?.message || String(e);
+    const net =
+      name === "TypeError" ||
+      /Failed to fetch|NetworkError|Load failed|ECONNREFUSED/i.test(msg);
+    throw new Error(
+      net
+        ? `Cannot reach relayer at ${RELAY_URL} (${msg}). Set VITE_RELAY_URL in Vercel to your Railway service HTTPS URL.`
+        : `Relayer fetch failed (${path}): ${msg}`
+    );
+  }
 }
 
 /** WalletConnect Cloud project id (required non-empty string for WalletConnect v2). */
@@ -532,15 +565,10 @@ const ERC20_ABI = [
  * ZK public inputs must match relayer fee + fee wallet from the server (`FEE_PERCENTAGE`, `FEE_WALLET_ADDRESS`).
  */
 async function fetchFeeConfig() {
-  const jsonHeaders = {
-    Accept: "application/json",
-    "Content-Type": "application/json",
-    "ngrok-skip-browser-warning": "true",
-  };
+  const jsonHeaders = { "Content-Type": "application/json" };
 
-  const tryFee = await fetch(buildRelayUrl("/fee-config"), {
+  let tryFee = await relayFetch("/fee-config", {
     method: "GET",
-    cache: "no-store",
     headers: jsonHeaders,
   });
   if (tryFee.ok) {
@@ -555,9 +583,8 @@ async function fetchFeeConfig() {
     }
   }
 
-  const tryRelayer = await fetch(buildRelayUrl("/relayer-address"), {
+  let tryRelayer = await relayFetch("/relayer-address", {
     method: "GET",
-    cache: "no-store",
     headers: jsonHeaders,
   });
   if (tryRelayer.ok) {
@@ -572,9 +599,8 @@ async function fetchFeeConfig() {
     }
   }
 
-  const ping = await fetch(buildRelayUrl("/relay"), {
+  const ping = await relayFetch("/relay", {
     method: "POST",
-    cache: "no-store",
     headers: jsonHeaders,
     body: JSON.stringify({ action: "ping" }),
   });
@@ -592,6 +618,31 @@ async function fetchFeeConfig() {
   throw new Error(
     "Relayer missing fee config (GET /fee-config, /relayer-address, or POST /relay with fee fields). Redeploy backend/relayer.js."
   );
+}
+
+/**
+ * Canonical decimal string for Circom uint256 fee + POST body (exact integer, no scientific notation).
+ */
+function normalizeRelayerFeeAtomic(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) throw new Error("Relayer returned an empty fee");
+  try {
+    const n = BigInt(/^0x/i.test(s) ? s : s);
+    if (n < 0n) throw new Error("negative fee");
+    return n.toString(10);
+  } catch {
+    throw new Error(`Relayer fee is not a valid integer: ${JSON.stringify(raw)}`);
+  }
+}
+
+/** Always call immediately before building the witness so the proof binds to the latest server fee. */
+async function fetchWithdrawFeeSnapshot(assetToken) {
+  const cfg = await fetchFeeConfig();
+  const feeWallet = getAddress(cfg.feeWallet);
+  const tok = String(assetToken || "ETH").toUpperCase() === "USDT" ? "USDT" : "ETH";
+  const raw = tok === "USDT" ? cfg.relayerFeeUsdt : cfg.relayerFeeEth;
+  const feeAtomicStr = normalizeRelayerFeeAtomic(raw);
+  return { feeWallet, feeAtomicStr, cfg, token: tok };
 }
 
 /**
@@ -816,7 +867,7 @@ function hintRelayerRpcPaymentError(msg) {
 }
 
 async function postRelay(body = {}) {
-  const res = await fetch(buildRelayUrl("/relay"), {
+  const res = await relayFetch("/relay", {
     method: "POST",
     headers: relayHeaders,
     body: JSON.stringify(body),
@@ -1160,7 +1211,13 @@ function PoolCard() {
     let cancelled = false;
     (async () => {
       try {
-        const r = await postRelay({});
+        const res = await relayFetch("/relay", {
+          method: "POST",
+          headers: relayHeaders,
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) throw new Error(`Relay HTTP ${res.status}`);
+        const r = await res.json();
         if (!cancelled) setRelayUp(r?.success === true);
       } catch {
         if (!cancelled) setRelayUp(false);
@@ -1579,10 +1636,6 @@ function PoolCard() {
         fetchWithdrawRoots(token),
       ]);
 
-      // Fetch fee config immediately before witness/proof generation so we
-      // bind to the relayer's latest expected fee.
-      const feeConfig = await fetchFeeConfig();
-      const relayerForWitness = getAddress(feeConfig.feeWallet);
       const { stateRoot, aspRoot } = roots;
       if (aspRoot === ZeroHash || BigInt(aspRoot) === 0n) {
         throw new Error(
@@ -1592,33 +1645,40 @@ function PoolCard() {
         );
       }
 
+      // Fee wallet + atomic fee are loaded inside buildProofAndRelay (fresh GET /fee-config each attempt).
       const nullifierHash = keccak256(randomBytes(32));
-      async function buildProofAndRelay(feeStrToUse) {
+
+      async function buildProofAndRelay() {
+        const { feeWallet, feeAtomicStr } = await fetchWithdrawFeeSnapshot(token);
+
         const witness = buildPoolPublicBindWitness({
           stateRootHex: stateRoot,
           aspRootHex: aspRoot,
           nullifierHashHex: nullifierHash,
           recipientAddr: withdrawRecipient,
-          relayerAddr: relayerForWitness,
-          feeStr: feeStrToUse,
+          relayerAddr: feeWallet,
+          feeStr: feeAtomicStr,
         });
 
         setStatus({
           kind: "info",
-          text: `Withdraw: generating proof for ${shortAddr(
+          text: `Withdraw: proving for ${shortAddr(
             withdrawRecipient
-          )} (worker thread, often 30–120s)…`,
+          )} (fee ${feeAtomicStr} atomic)…`,
         });
-        console.log("[withdraw] Step 2: generateWithdrawBindingProof", {
-          feeStr: feeStrToUse,
+        console.log("[withdraw] witness bind", {
+          feeAtomicStr,
+          feeWallet,
+          token,
         });
+
         const zkBundle = await generateWithdrawBindingProof(
           wasmBytes,
           zkeyBytes,
           witness
         );
         console.log(
-          "[withdraw] Step 2 OK: proofHex length:",
+          "[withdraw] groth16 OK; proofHex length:",
           zkBundle.proofHex?.length
         );
 
@@ -1628,7 +1688,7 @@ function PoolCard() {
           commitment: lastCommitment.current ?? null,
           token,
           withdrawSpeed,
-          fee: feeStrToUse,
+          fee: feeAtomicStr,
           proof: zkBundle.proofHex,
           publicSignals: JSON.parse(
             JSON.stringify(zkBundle.publicSignals, (_, v) =>
@@ -1641,7 +1701,7 @@ function PoolCard() {
         };
 
         setStatus({ kind: "info", text: "Withdraw: calling relayer…" });
-        console.log("[withdraw] Step 3 POST", buildRelayUrl("/relay"), {
+        console.log("[withdraw] POST /relay", buildRelayUrl("/relay"), {
           ...relayBody,
           proof: `(hex ${relayBody.proof.length} chars)`,
         });
@@ -1649,27 +1709,29 @@ function PoolCard() {
         return postRelay(relayBody);
       }
 
-      const initialFeeStr =
-        token === "ETH" ? feeConfig.relayerFeeEth : feeConfig.relayerFeeUsdt;
-      let r = await buildProofAndRelay(initialFeeStr);
+      const maxAttempts = 3;
+      let r = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        r = await buildProofAndRelay();
+        if (r?.success) break;
 
-      // Gas can move while proving; if relayer reports the exact expected fee,
-      // regenerate witness/proof once with that fee and retry automatically.
-      if (
-        !r?.success &&
-        typeof r?.expectedRelayerFee === "string" &&
-        r.expectedRelayerFee !== initialFeeStr &&
-        /Relayer fee mismatch/i.test(String(r?.message || ""))
-      ) {
-        console.warn("[withdraw] fee mismatch, regenerating proof once", {
-          initialFeeStr,
-          expectedRelayerFee: r.expectedRelayerFee,
-        });
-        setStatus({
-          kind: "info",
-          text: "Relayer fee changed while proving; regenerating proof with exact fee…",
-        });
-        r = await buildProofAndRelay(r.expectedRelayerFee);
+        const msg = String(r?.message || "");
+        const feeDrift =
+          /Relayer fee mismatch/i.test(msg) && attempt < maxAttempts;
+
+        if (feeDrift) {
+          console.warn("[withdraw] fee drift vs server; refetch + reprove", {
+            attempt,
+            msg,
+            expectedRelayerFee: r?.expectedRelayerFee,
+          });
+          setStatus({
+            kind: "info",
+            text: `Relayer fee moved during proving; retry ${attempt + 1}/${maxAttempts}…`,
+          });
+          continue;
+        }
+        break;
       }
 
       console.log("[withdraw] Step 4 relayer JSON:", r);
@@ -1697,14 +1759,9 @@ function PoolCard() {
       text: "Requesting burner wallet from relayer…",
     });
     try {
-      const res = await fetch(buildRelayUrl("/generate-burner"), {
+      const res = await relayFetch("/generate-burner", {
         method: "POST",
-        cache: "no-store",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "ngrok-skip-browser-warning": "true",
-        },
+        headers: relayHeaders,
         body: JSON.stringify({ nonce: Date.now() }),
       });
       if (!res.ok) {
