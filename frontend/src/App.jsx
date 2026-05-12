@@ -897,6 +897,79 @@ function shortAddr(addr) {
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
 }
 
+async function copyToClipboard(text) {
+  const s = String(text ?? "");
+  if (!s) return;
+  try {
+    await navigator.clipboard.writeText(s);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      document.execCommand("copy");
+    } finally {
+      document.body.removeChild(ta);
+    }
+  }
+}
+
+/** EIP-1193 (injected or WalletConnect) for `wallet_watchAsset`. */
+async function getWalletEip1193Provider() {
+  if (
+    typeof window !== "undefined" &&
+    window.ethereum &&
+    !isInjectedEthereumStub()
+  ) {
+    return window.ethereum;
+  }
+  const connector = getAccount()?.connector;
+  if (connector?.getProvider) {
+    try {
+      const raw = await connector.getProvider();
+      if (raw?.request) return raw;
+    } catch {
+      /* ignore */
+    }
+  }
+  if (
+    typeof window !== "undefined" &&
+    window.ethereum &&
+    !isInjectedEthereumStub()
+  ) {
+    return window.ethereum;
+  }
+  return null;
+}
+
+/** EIP-747 — add ERC-20 to wallet token list (MetaMask, etc.). */
+async function watchAssetErc20(eip1193, tokenAddress, symbol, decimals) {
+  const checksum = getAddress(tokenAddress);
+  const payload = {
+    type: "ERC20",
+    options: {
+      address: checksum,
+      symbol,
+      decimals,
+    },
+  };
+  try {
+    await eip1193.request({
+      method: "wallet_watchAsset",
+      params: payload,
+    });
+  } catch {
+    await eip1193.request({
+      method: "wallet_watchAsset",
+      params: [payload],
+    });
+  }
+}
+
 /* ------------------------------ Theme ------------------------------- */
 
 const theme = {
@@ -1081,6 +1154,18 @@ const styles = {
     borderRadius: 12,
     cursor: "pointer",
   },
+  copyBtn: {
+    appearance: "none",
+    flexShrink: 0,
+    padding: "4px 10px",
+    fontSize: 11,
+    fontWeight: 600,
+    color: theme.subtle,
+    background: "rgba(0,0,0,0.35)",
+    border: `1px solid ${theme.border}`,
+    borderRadius: 8,
+    cursor: "pointer",
+  },
   burnerPanel: {
     marginTop: 14,
     padding: "14px 14px",
@@ -1109,6 +1194,58 @@ const styles = {
 };
 
 /* ----------------------------- UI bits ------------------------------ */
+
+function CopyTextButton({ textToCopy, label = "Copy", disabled = false }) {
+  const [done, setDone] = useState(false);
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          await copyToClipboard(textToCopy);
+          setDone(true);
+          setTimeout(() => setDone(false), 1800);
+        } catch {
+          /* ignore */
+        }
+      }}
+      style={{
+        ...styles.copyBtn,
+        opacity: disabled ? 0.5 : 1,
+        cursor: disabled ? "not-allowed" : "pointer",
+      }}
+      title="Copy full value"
+    >
+      {done ? "Copied" : label}
+    </button>
+  );
+}
+
+function TruncatedAddrRow({ label, address }) {
+  const full = getAddress(address);
+  return (
+    <div style={styles.row}>
+      <span>{label}</span>
+      <span
+        style={{
+          ...styles.rowValue,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "flex-end",
+          gap: 8,
+          flexWrap: "wrap",
+          textAlign: "right",
+        }}
+      >
+        <span title={full}>{shortAddr(full)}</span>
+        <CopyTextButton textToCopy={full} />
+      </span>
+    </div>
+  );
+}
 
 /**
  * React subscription to wagmi's account state without pulling in the full
@@ -1160,18 +1297,29 @@ function ConnectButton() {
     );
   }
   return (
-    <button
+    <div
       style={{
-        ...styles.connect,
-        background: "transparent",
-        color: theme.text,
-        border: `1px solid ${theme.border}`,
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        flexWrap: "wrap",
+        justifyContent: "flex-end",
       }}
-      onClick={handleDisconnect}
-      title={address}
     >
-      {shortAddr(address)} · Disconnect
-    </button>
+      <CopyTextButton textToCopy={address} />
+      <button
+        style={{
+          ...styles.connect,
+          background: "transparent",
+          color: theme.text,
+          border: `1px solid ${theme.border}`,
+        }}
+        onClick={handleDisconnect}
+        title={address}
+      >
+        {shortAddr(address)} · Disconnect
+      </button>
+    </div>
   );
 }
 
@@ -1188,8 +1336,10 @@ function PoolCard() {
   const [ethDenom, setEthDenom] = useState("0.01");
   const [ethWithdrawFee, setEthWithdrawFee] = useState("0.001");
   const [usdtDenom, setUsdtDenom] = useState("100");
-  const [usdtWithdrawFee, setUsdtWithdrawFee] = useState("1");
+  const [usdtWithdrawFee, setUsdtWithdrawFee] = useState("0.1");
   const [relayUp, setRelayUp] = useState(null);
+  const [showAddUsdtAfterWithdraw, setShowAddUsdtAfterWithdraw] = useState(false);
+  const [addTokenBusy, setAddTokenBusy] = useState(false);
   const lastCommitment = useRef(null);
 
   const seg = useCallback((active) => {
@@ -1205,6 +1355,33 @@ function PoolCard() {
       fontSize: 12,
       cursor: "pointer",
     };
+  }, []);
+
+  const handleAddMockUsdtToWallet = useCallback(async () => {
+    setAddTokenBusy(true);
+    try {
+      const eth = await getWalletEip1193Provider();
+      if (!eth?.request) {
+        throw new Error(
+          "No wallet provider. Connect MetaMask (or a wallet that supports token import) on Sepolia."
+        );
+      }
+      await watchAssetErc20(eth, MOCK_USDT_ADDRESS, "USDT", 6);
+      setStatus((prev) => ({
+        kind: "success",
+        text:
+          prev.kind === "success" && prev.text
+            ? `${prev.text} Mock USDT token added to your wallet.`
+            : "Mock USDT token added to your wallet.",
+      }));
+    } catch (e) {
+      setStatus({
+        kind: "error",
+        text: `Add token failed: ${e?.message || e}`,
+      });
+    } finally {
+      setAddTokenBusy(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -1429,6 +1606,7 @@ function PoolCard() {
     if (!address) return;
 
     setDepositBusy(true);
+    setShowAddUsdtAfterWithdraw(false);
     const runId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     console.log(`[deposit] === start run ${runId} ===`);
 
@@ -1624,6 +1802,7 @@ function PoolCard() {
     const withdrawRecipient = burnerWallet?.address || address;
 
     setWithdrawBusy(true);
+    setShowAddUsdtAfterWithdraw(false);
     setStatus({
       kind: "info",
       text: "Withdraw: loading artifacts and chain data…",
@@ -1739,8 +1918,10 @@ function PoolCard() {
         kind: r?.success ? "success" : "error",
         text: hintRelayerRpcPaymentError(r?.message || "Relayer responded."),
       });
+      setShowAddUsdtAfterWithdraw(Boolean(r?.success && token === "USDT"));
     } catch (e) {
       console.error("[withdraw] FAILED", wid, e);
+      setShowAddUsdtAfterWithdraw(false);
       setStatus({
         kind: "error",
         text: `Withdraw failed: ${hintRelayerRpcPaymentError(e?.message || e)}`,
@@ -1826,14 +2007,8 @@ function PoolCard() {
         <span>Network</span>
         <span style={styles.rowValue}>Sepolia</span>
       </div>
-      <div style={styles.row}>
-        <span>Pool</span>
-        <span style={styles.rowValue}>{shortAddr(POOL_ADDRESS)}</span>
-      </div>
-      <div style={styles.row}>
-        <span>USDT (mock)</span>
-        <span style={styles.rowValue}>{shortAddr(MOCK_USDT_ADDRESS)}</span>
-      </div>
+      <TruncatedAddrRow label="Pool" address={POOL_ADDRESS} />
+      <TruncatedAddrRow label="USDT (mock)" address={MOCK_USDT_ADDRESS} />
 
       {token === "ETH" ? (
         <>
@@ -1930,18 +2105,75 @@ function PoolCard() {
 
       {burnerWallet ? (
         <div style={styles.burnerPanel}>
-          <div style={styles.burnerFieldLabel}>Address</div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 8,
+              marginBottom: 6,
+            }}
+          >
+            <div style={styles.burnerFieldLabel}>Address</div>
+            <CopyTextButton textToCopy={burnerWallet.address} />
+          </div>
           <span style={{ ...styles.burnerMono, marginBottom: 12 }}>
             {burnerWallet.address}
           </span>
-          <div style={{ ...styles.burnerFieldLabel, marginTop: 14 }}>
-            Private key (copy once, store offline — never commit)
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 8,
+              marginTop: 14,
+              marginBottom: 6,
+            }}
+          >
+            <div style={styles.burnerFieldLabel}>
+              Private key (copy once, store offline — never commit)
+            </div>
+            <CopyTextButton textToCopy={burnerWallet.privateKey} />
           </div>
           <span style={styles.burnerMono}>{burnerWallet.privateKey}</span>
         </div>
       ) : null}
 
-      <div style={styles.status(status.kind)}>{status.text}</div>
+      <div
+        style={{
+          marginTop: 14,
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "stretch",
+          gap: 10,
+        }}
+      >
+        <div
+          style={{
+            ...styles.status(status.kind),
+            marginTop: 0,
+            flex: "1 1 220px",
+            minWidth: 0,
+          }}
+        >
+          {status.text}
+        </div>
+        {status.kind === "success" && showAddUsdtAfterWithdraw ? (
+          <button
+            type="button"
+            style={{
+              ...styles.secondary,
+              alignSelf: "center",
+              flex: "0 0 auto",
+              whiteSpace: "nowrap",
+            }}
+            onClick={() => void handleAddMockUsdtToWallet()}
+            disabled={addTokenBusy || connectBusy}
+          >
+            {addTokenBusy ? "Adding…" : "Add USDT to Wallet"}
+          </button>
+        ) : null}
+      </div>
     </div>
   );
 }

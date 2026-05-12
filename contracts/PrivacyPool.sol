@@ -38,7 +38,8 @@ contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownabl
     uint256 public constant ETH_DENOMINATION = 0.01 ether;
     uint256 public constant PROTOCOL_WITHDRAW_FEE_ETH = 0.001 ether;
     uint256 public constant USDT_DENOMINATION = 100 * 1e6;
-    uint256 public constant PROTOCOL_WITHDRAW_FEE_USDT = 1 * 1e6;
+    /// @notice 0.1 USDT (6 decimals) — aligns with 0.1% competitive framing on 100 USDT notes.
+    uint256 public constant PROTOCOL_WITHDRAW_FEE_USDT = 100_000;
     uint32  public constant ASP_ROOT_HISTORY = 64;
 
     IVerifier              public immutable verifier;

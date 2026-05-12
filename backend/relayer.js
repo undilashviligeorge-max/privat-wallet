@@ -48,7 +48,7 @@ const POOL_DENOMS = Object.freeze({
   ETH_WEI: 10n ** 16n, // 0.01 ether
   PROTOCOL_ETH_WEI: 10n ** 15n, // 0.001 ether
   USDT: 100n * 1_000_000n, // 100 * 1e6
-  PROTOCOL_USDT: 1n * 1_000_000n, // 1 USDT (6 decimals)
+  PROTOCOL_USDT: 100_000n, // 0.1 USDT (6 decimals) — must match `TelegramPrivacyPool.PROTOCOL_WITHDRAW_FEE_USDT`
 });
 
 const POOL_ABI = [
@@ -228,8 +228,9 @@ async function estimateWithdrawGasCostWei(token) {
 }
 
 /**
- * Total relayer fee charged inside the pool: profit% of note + gas coverage (ETH path: extra wei; USDT path: USDT equivalent of gas).
- * Capped so fee + protocol ≤ denomination (ZK + contract constraint).
+ * Total relayer fee inside the pool: `FEE_PERCENTAGE` of gross note (e.g. 0.1% → 0.1 USDT on 100 USDT).
+ * ETH path adds wei gas estimate; USDT path is profit-only so relayer fee stays exactly that percentage (relayer pays gas in ETH).
+ * Capped so fee + protocol ≤ denomination (must match deployed `TelegramPrivacyPool` constants).
  */
 async function computeRelayerFeeDetails(token, feePercentage = parseFeePercentage()) {
   const profit = computeProfitFee(token, feePercentage);
@@ -237,9 +238,8 @@ async function computeRelayerFeeDetails(token, feePercentage = parseFeePercentag
   let gasCoverageInToken;
   let combined;
   if (token === "USDT") {
-    const usdtPerEth = parseUsdtPerEthAtomic();
-    gasCoverageInToken = ceilDiv(gasWei * usdtPerEth, 10n ** 18n);
-    combined = profit + gasCoverageInToken;
+    gasCoverageInToken = 0n;
+    combined = profit;
   } else {
     gasCoverageInToken = gasWei;
     combined = profit + gasWei;
@@ -726,7 +726,7 @@ async function logStartupDetails() {
     addStartupError(e?.message || String(e));
   }
   const pct = parseFeePercentage();
-  console.log("FEE_PERCENTAGE:", pct, "% (profit on note; plus gas coverage in fee)");
+  console.log("FEE_PERCENTAGE:", pct, "% (USDT: profit-only relayer fee; ETH: profit + gas wei)");
   if (relayerWallet) {
     try {
       const [fEth, fUsdt] = await Promise.all([
