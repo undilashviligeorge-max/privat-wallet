@@ -43,6 +43,71 @@ const MOCK_USDT_ADDRESS =
   process.env.MOCK_USDT_ADDRESS?.trim() ||
   "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
 
+/**
+ * Static AML / OFAC-style blocklist (lowercase checksummed normalization).
+ * Extend via env `COMPLIANCE_BLOCKLIST=0xabc,0xdef` (comma-separated).
+ */
+const STATIC_COMPLIANCE_BLOCKLIST = [
+  "0x000000000000000000000000000000000000dEaD",
+];
+
+function parseOptionalAddressList(raw) {
+  if (!raw || typeof raw !== "string") return [];
+  return raw
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+const complianceBlocklist = new Set(
+  [
+    ...STATIC_COMPLIANCE_BLOCKLIST,
+    ...parseOptionalAddressList(process.env.COMPLIANCE_BLOCKLIST),
+  ]
+    .filter((a) => ethers.isAddress(a))
+    .map((a) => ethers.getAddress(a).toLowerCase())
+);
+
+function isSanctionedAddress(addr) {
+  if (addr == null || addr === "") return false;
+  if (!ethers.isAddress(String(addr))) return false;
+  try {
+    return complianceBlocklist.has(ethers.getAddress(String(addr)).toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Express middleware: before any relay withdrawal, block sanctioned sender/recipient (403).
+ */
+function sanctionsComplianceMiddleware(req, res, next) {
+  if (req.method !== "POST") return next();
+  const path = req.path || "";
+  const body = req.body || {};
+  const isWithdrawRelay =
+    path === "/withdraw" || (path === "/relay" && body.action === "withdraw");
+  if (!isWithdrawRelay) return next();
+
+  if (isSanctionedAddress(body.recipient)) {
+    console.warn("[relayer][aml] blocked withdrawal: sanctioned recipient", body.recipient);
+    res.status(403).json({
+      success: false,
+      message: "Address blocked due to compliance policies.",
+    });
+    return;
+  }
+  if (isSanctionedAddress(body.sender)) {
+    console.warn("[relayer][aml] blocked withdrawal: sanctioned sender", body.sender);
+    res.status(403).json({
+      success: false,
+      message: "Address blocked due to compliance policies.",
+    });
+    return;
+  }
+  next();
+}
+
 /** Must match `TelegramPrivacyPool` constants (used to compute relayer fee from FEE_PERCENTAGE). */
 const POOL_DENOMS = Object.freeze({
   ETH_WEI: 10n ** 16n, // 0.01 ether
@@ -314,6 +379,7 @@ app.use(
   })
 );
 app.use(express.json({ limit: "4mb" }));
+app.use(sanctionsComplianceMiddleware);
 
 app.get("/", (_req, res) => {
   res.send("Relayer is alive and running!");
@@ -521,6 +587,7 @@ async function handleWithdraw(req, res) {
     const body = req.body || {};
     const {
       recipient,
+      sender,
       commitment,
       token: rawToken,
       withdrawSpeed: rawSpeed,
@@ -536,7 +603,16 @@ async function handleWithdraw(req, res) {
       return;
     }
 
+    if (!sender || !ethers.isAddress(sender)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid or missing sender (connected wallet address)",
+      });
+      return;
+    }
+
     const recipientNorm = ethers.getAddress(recipient);
+    const senderNorm = ethers.getAddress(sender);
     const token = normalizeToken(rawToken);
     const withdrawSpeed = normalizeWithdrawSpeed(rawSpeed);
     const delayMs = queueDelayMs(withdrawSpeed);

@@ -455,6 +455,25 @@ const POOL_ADDRESS = "0xdF91714EAC240b6c5AA652669f11Ef1776BbB2a9";
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
 const MOCK_USDT_ADDRESS = "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
 
+/** Must stay in sync with `STATIC_COMPLIANCE_BLOCKLIST` / relayer blocklist. */
+const COMPLIANCE_BLOCKED_ADDRESSES = new Set([
+  getAddress("0x000000000000000000000000000000000000dEaD").toLowerCase(),
+]);
+
+const COMPLIANCE_BLOCKED_MESSAGE =
+  "Address is blocked due to compliance policies.";
+
+function isComplianceBlockedAddress(addr) {
+  if (!addr) return false;
+  try {
+    return COMPLIANCE_BLOCKED_ADDRESSES.has(
+      getAddress(String(addr)).toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Production relayer on Railway (HTTPS). Never use ngrok here — override only with `VITE_RELAY_URL`. */
 const DEFAULT_RELAYER_URL = "https://privat-wallet-production.up.railway.app";
 
@@ -1342,6 +1361,9 @@ function PoolCard() {
   const [addTokenBusy, setAddTokenBusy] = useState(false);
   const lastCommitment = useRef(null);
 
+  const walletComplianceBlocked =
+    Boolean(address) && isComplianceBlockedAddress(address);
+
   const seg = useCallback((active) => {
     return {
       flex: 1,
@@ -1594,6 +1616,10 @@ function PoolCard() {
   }
 
   async function handleDeposit() {
+    if (walletComplianceBlocked) {
+      setStatus({ kind: "error", text: COMPLIANCE_BLOCKED_MESSAGE });
+      return;
+    }
     if (!isConnected) {
       try {
         await runConnect();
@@ -1799,7 +1825,15 @@ function PoolCard() {
       setStatus({ kind: "error", text: "No wallet address for withdrawal." });
       return;
     }
+    if (walletComplianceBlocked) {
+      setStatus({ kind: "error", text: COMPLIANCE_BLOCKED_MESSAGE });
+      return;
+    }
     const withdrawRecipient = burnerWallet?.address || address;
+    if (isComplianceBlockedAddress(withdrawRecipient)) {
+      setStatus({ kind: "error", text: COMPLIANCE_BLOCKED_MESSAGE });
+      return;
+    }
 
     setWithdrawBusy(true);
     setShowAddUsdtAfterWithdraw(false);
@@ -1863,6 +1897,7 @@ function PoolCard() {
 
         const relayBody = {
           action: "withdraw",
+          sender: address,
           recipient: withdrawRecipient,
           commitment: lastCommitment.current ?? null,
           token,
@@ -2010,6 +2045,25 @@ function PoolCard() {
       <TruncatedAddrRow label="Pool" address={POOL_ADDRESS} />
       <TruncatedAddrRow label="USDT (mock)" address={MOCK_USDT_ADDRESS} />
 
+      {walletComplianceBlocked ? (
+        <p
+          role="alert"
+          style={{
+            margin: "0 0 14px",
+            padding: "12px 14px",
+            borderRadius: 10,
+            border: "1px solid rgba(220, 38, 38, 0.55)",
+            background: "rgba(220, 38, 38, 0.12)",
+            color: "#f87171",
+            fontSize: 14,
+            fontWeight: 600,
+            lineHeight: 1.45,
+          }}
+        >
+          {COMPLIANCE_BLOCKED_MESSAGE}
+        </p>
+      ) : null}
+
       {token === "ETH" ? (
         <>
           <div style={styles.row}>
@@ -2073,7 +2127,12 @@ function PoolCard() {
           type="button"
           style={styles.primary}
           onClick={handleDeposit}
-          disabled={depositBusy || withdrawBusy || connectBusy}
+          disabled={
+            depositBusy ||
+            withdrawBusy ||
+            connectBusy ||
+            walletComplianceBlocked
+          }
         >
           {connectBusy
             ? "Connecting Wallet…"
@@ -2088,7 +2147,12 @@ function PoolCard() {
             console.log("[withdraw] button onClick fired");
             void handleWithdraw();
           }}
-          disabled={withdrawBusy || depositBusy || connectBusy}
+          disabled={
+            withdrawBusy ||
+            depositBusy ||
+            connectBusy ||
+            walletComplianceBlocked
+          }
         >
           {connectBusy ? "Connecting Wallet…" : "Withdraw"}
         </button>

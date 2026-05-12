@@ -13,18 +13,22 @@ function normalizePrivateKey(key) {
   return k.startsWith("0x") ? k : `0x${k}`;
 }
 
+const PUBLIC_SEPOLIA_RPC =
+  process.env.SEPOLIA_RPC_URL?.trim() ||
+  "https://ethereum-sepolia-rpc.publicnode.com";
+
 /**
  * Sepolia: process.env.TATUM_RPC_URL and process.env.PRIVATE_KEY.
- * Bare Tatum testnet keys (no http prefix) use the gateway with x-api-key.
+ * Bare Tatum testnet keys use the gateway for paid tiers; free tier often blocks eth_call — fall back to public RPC.
  */
 function buildSepolia() {
   const rawUrlOrKey = process.env.TATUM_RPC_URL?.trim();
   const privateKey = normalizePrivateKey(process.env.PRIVATE_KEY ?? "");
-  if (!rawUrlOrKey || !privateKey) return null;
+  if (!privateKey) return null;
 
   const accounts = [privateKey];
 
-  if (rawUrlOrKey.startsWith("http://") || rawUrlOrKey.startsWith("https://")) {
+  if (rawUrlOrKey?.startsWith("http://") || rawUrlOrKey?.startsWith("https://")) {
     return {
       type: "http",
       chainType: "l1",
@@ -33,11 +37,19 @@ function buildSepolia() {
     };
   }
 
+  if (!rawUrlOrKey) {
+    return {
+      type: "http",
+      chainType: "l1",
+      url: PUBLIC_SEPOLIA_RPC,
+      accounts,
+    };
+  }
+
   return {
     type: "http",
     chainType: "l1",
-    url: "https://ethereum-sepolia.gateway.tatum.io",
-    httpHeaders: { "x-api-key": rawUrlOrKey },
+    url: PUBLIC_SEPOLIA_RPC,
     accounts,
   };
 }

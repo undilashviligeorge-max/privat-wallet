@@ -1,7 +1,19 @@
 import { network } from "hardhat";
 
 const DEFAULT_MOCK_USDT = "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
-const MINT_UNITS = 10_000n * 10n ** 6n; // 10,000 USDT with 6 decimals
+/** Whole USDT units (6 decimals applied). Override: MINT_USDT=10000000 */
+const MINT_USDT_WHOLE = (() => {
+  const raw = process.env.MINT_USDT?.trim();
+  if (raw) {
+    try {
+      return BigInt(raw);
+    } catch {
+      throw new Error(`Invalid MINT_USDT: ${raw}`);
+    }
+  }
+  return 10_000n;
+})();
+const MINT_UNITS = MINT_USDT_WHOLE * 10n ** 6n;
 
 async function main() {
   const { ethers } = await network.connect();
