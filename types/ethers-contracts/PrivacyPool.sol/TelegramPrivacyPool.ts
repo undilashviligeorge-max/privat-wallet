@@ -6,7 +6,7 @@ import type { TypedContractEvent, TypedDeferredTopicFilter, TypedEventLog, Typed
   
 
   export interface TelegramPrivacyPoolInterface extends Interface {
-    getFunction(nameOrSignature: "ASP_ROLE" | "ASP_ROOT_HISTORY" | "COMPLIANCE_ROLE" | "DEFAULT_ADMIN_ROLE" | "ETH_DENOMINATION" | "PAUSER_ROLE" | "PROTOCOL_WITHDRAW_FEE_ETH" | "PROTOCOL_WITHDRAW_FEE_USDT" | "USDT_DENOMINATION" | "accumulatedProtocolFeesEth" | "accumulatedProtocolFeesUsdt" | "addSanctioned" | "aspRootIndex" | "aspRoots" | "deposit" | "depositAmountRequired" | "depositUsdt" | "ethCommitments" | "ethNullifierHashes" | "ethStateTree" | "getRoleAdmin" | "grantRole" | "hasRole" | "isKnownAspRoot" | "isSanctioned" | "knownAspRoot" | "localSanctionedAt" | "localSanctionedLength" | "owner" | "pause" | "paused" | "publishAspRoot" | "removeSanctioned" | "renounceOwnership" | "renounceRole" | "revokeRole" | "sanctionsOracle" | "supportsInterface" | "transferOwnership" | "unpause" | "usdt" | "usdtCommitments" | "usdtDepositAmountRequired" | "usdtNullifierHashes" | "usdtStateTree" | "verifier" | "withdraw" | "withdrawFees" | "withdrawUsdt"): FunctionFragment;
+    getFunction(nameOrSignature: "ASP_ROLE" | "ASP_ROOT_HISTORY" | "COMPLIANCE_ROLE" | "DEFAULT_ADMIN_ROLE" | "ETH_DENOMINATION" | "PAUSER_ROLE" | "PROTOCOL_WITHDRAW_FEE_ETH" | "PROTOCOL_WITHDRAW_FEE_USDT" | "SNARK_SCALAR_FIELD" | "USDT_DENOMINATION" | "accumulatedProtocolFeesEth" | "accumulatedProtocolFeesUsdt" | "addSanctioned" | "aspRootIndex" | "aspRoots" | "deposit" | "depositAmountRequired" | "depositUsdt" | "ethCommitments" | "ethNullifierHashes" | "ethStateTree" | "getRoleAdmin" | "grantRole" | "hasRole" | "isKnownAspRoot" | "isSanctioned" | "knownAspRoot" | "localSanctionedAt" | "localSanctionedLength" | "owner" | "pause" | "paused" | "publishAspRoot" | "removeSanctioned" | "renounceOwnership" | "renounceRole" | "revokeRole" | "sanctionsOracle" | "supportsInterface" | "transferOwnership" | "unpause" | "usdt" | "usdtCommitments" | "usdtDepositAmountRequired" | "usdtNullifierHashes" | "usdtStateTree" | "verifier" | "withdraw" | "withdrawFees" | "withdrawUsdt"): FunctionFragment;
 
     getEvent(nameOrSignatureOrTopic: "AspRootUpdated" | "DepositEth" | "DepositUsdt" | "OwnershipTransferred" | "Paused" | "ProtocolFeesWithdrawn" | "RoleAdminChanged" | "RoleGranted" | "RoleRevoked" | "SanctionedAddressAdded" | "SanctionedAddressRemoved" | "Unpaused" | "WithdrawalEth" | "WithdrawalUsdt"): EventFragment;
 
@@ -18,6 +18,7 @@ encodeFunctionData(functionFragment: 'ETH_DENOMINATION', values?: undefined): st
 encodeFunctionData(functionFragment: 'PAUSER_ROLE', values?: undefined): string;
 encodeFunctionData(functionFragment: 'PROTOCOL_WITHDRAW_FEE_ETH', values?: undefined): string;
 encodeFunctionData(functionFragment: 'PROTOCOL_WITHDRAW_FEE_USDT', values?: undefined): string;
+encodeFunctionData(functionFragment: 'SNARK_SCALAR_FIELD', values?: undefined): string;
 encodeFunctionData(functionFragment: 'USDT_DENOMINATION', values?: undefined): string;
 encodeFunctionData(functionFragment: 'accumulatedProtocolFeesEth', values?: undefined): string;
 encodeFunctionData(functionFragment: 'accumulatedProtocolFeesUsdt', values?: undefined): string;
@@ -68,6 +69,7 @@ decodeFunctionResult(functionFragment: 'ETH_DENOMINATION', data: BytesLike): Res
 decodeFunctionResult(functionFragment: 'PAUSER_ROLE', data: BytesLike): Result;
 decodeFunctionResult(functionFragment: 'PROTOCOL_WITHDRAW_FEE_ETH', data: BytesLike): Result;
 decodeFunctionResult(functionFragment: 'PROTOCOL_WITHDRAW_FEE_USDT', data: BytesLike): Result;
+decodeFunctionResult(functionFragment: 'SNARK_SCALAR_FIELD', data: BytesLike): Result;
 decodeFunctionResult(functionFragment: 'USDT_DENOMINATION', data: BytesLike): Result;
 decodeFunctionResult(functionFragment: 'accumulatedProtocolFeesEth', data: BytesLike): Result;
 decodeFunctionResult(functionFragment: 'accumulatedProtocolFeesUsdt', data: BytesLike): Result;
@@ -371,6 +373,14 @@ decodeFunctionResult(functionFragment: 'withdrawUsdt', data: BytesLike): Result;
 
     
     PROTOCOL_WITHDRAW_FEE_USDT: TypedContractMethod<
+      [],
+      [bigint],
+      'view'
+    >
+    
+
+    
+    SNARK_SCALAR_FIELD: TypedContractMethod<
       [],
       [bigint],
       'view'
@@ -744,6 +754,11 @@ getFunction(nameOrSignature: 'PROTOCOL_WITHDRAW_FEE_ETH'): TypedContractMethod<
       'view'
     >;
 getFunction(nameOrSignature: 'PROTOCOL_WITHDRAW_FEE_USDT'): TypedContractMethod<
+      [],
+      [bigint],
+      'view'
+    >;
+getFunction(nameOrSignature: 'SNARK_SCALAR_FIELD'): TypedContractMethod<
       [],
       [bigint],
       'view'

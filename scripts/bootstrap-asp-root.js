@@ -14,7 +14,7 @@ import { network } from "hardhat";
 
 const DEFAULT_POOL =
   process.env.POOL_ADDRESS?.trim() ||
-  "0xdF91714EAC240b6c5AA652669f11Ef1776BbB2a9";
+  "0xA53f26482dD78Baac3d1eC84E9a643B89e750145";
 
 const BOOTSTRAP_LABEL = "telegram-privacy-pool-asp-bootstrap-v1";
 

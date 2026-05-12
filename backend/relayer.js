@@ -36,12 +36,12 @@ function envFirst(...keys) {
 /** Deployed TelegramPrivacyPool on Sepolia (override with POOL_ADDRESS in .env). */
 const POOL_ADDRESS =
   process.env.POOL_ADDRESS?.trim() ||
-  "0xdF91714EAC240b6c5AA652669f11Ef1776BbB2a9";
+  "0xA53f26482dD78Baac3d1eC84E9a643B89e750145";
 
 /** Mock ERC20 USDT used by the pool on Sepolia (override with MOCK_USDT_ADDRESS in .env). */
 const MOCK_USDT_ADDRESS =
   process.env.MOCK_USDT_ADDRESS?.trim() ||
-  "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
+  "0x7F55f82979cb5cFdfe6DAaaDC96eF169EB63C52A";
 
 /**
  * Static AML / OFAC-style blocklist (lowercase checksummed normalization).
@@ -126,6 +126,10 @@ const POOL_ABI = [
   "error EthTransferFailed()",
   "error RecipientSanctioned(address)",
   "error RelayerSanctioned(address)",
+  "error ERC20InsufficientBalance(address,uint256,uint256)",
+  "error ERC20InvalidSender(address)",
+  "error ERC20InvalidReceiver(address)",
+  "error ERC20InsufficientAllowance(address,uint256,uint256)",
   "function withdraw(bytes proof, bytes32 stateRoot, bytes32 aspRoot, bytes32 nullifierHash, address payable recipient, address payable relayer, uint256 fee) external",
   "function withdrawUsdt(bytes proof, bytes32 stateRoot, bytes32 aspRoot, bytes32 nullifierHash, address recipient, address relayer, uint256 fee) external",
 ];
@@ -501,6 +505,20 @@ async function tryBroadcastWithdraw(p) {
   }
 
   try {
+    const txArgs = [proofBytes, sr, ar, nh, recipient, feeWallet, feeBn];
+    const preflightError = await preflightWithdrawCall(pool, token, txArgs);
+    if (preflightError) {
+      console.error("[relayer] withdraw preflight revert", preflightError);
+      return {
+        success: false,
+        message: preflightError,
+        token,
+        pool: POOL_ADDRESS,
+        mockUsdt: token === "USDT" ? MOCK_USDT_ADDRESS : undefined,
+        preflight: true,
+      };
+    }
+
     if (token === "USDT") {
       console.log(
         "[relayer] Broadcasting withdrawUsdt → pool",
@@ -512,7 +530,7 @@ async function tryBroadcastWithdraw(p) {
         "relayerFee",
         feeBn.toString()
       );
-      const tx = await pool.withdrawUsdt(proofBytes, sr, ar, nh, recipient, feeWallet, feeBn);
+      const tx = await pool.withdrawUsdt(...txArgs);
       const receipt = await tx.wait();
       console.log("[relayer] USDT withdrawal confirmed", receipt.hash);
       return {
@@ -533,7 +551,7 @@ async function tryBroadcastWithdraw(p) {
       "relayerFee",
       feeBn.toString()
     );
-    const tx = await pool.withdraw(proofBytes, sr, ar, nh, recipient, feeWallet, feeBn);
+    const tx = await pool.withdraw(...txArgs);
     const receipt = await tx.wait();
     console.log("[relayer] ETH withdrawal confirmed", receipt.hash);
     return {
@@ -558,11 +576,17 @@ async function tryBroadcastWithdraw(p) {
 
 function decodePoolError(iface, err) {
   const fallback = err?.shortMessage || err?.reason || err?.message || String(err);
+  const regexHex = (s) =>
+    typeof s === "string" ? s.match(/0x[0-9a-fA-F]{8,}/g) || [] : [];
   const candidates = [
     err?.data,
     err?.error?.data,
     err?.info?.error?.data,
     err?.receipt?.revertReason,
+    ...regexHex(err?.message),
+    ...regexHex(err?.shortMessage),
+    ...regexHex(err?.error?.message),
+    ...regexHex(err?.info?.error?.message),
   ].filter((v) => typeof v === "string" && v.startsWith("0x"));
 
   for (const data of candidates) {
@@ -580,6 +604,19 @@ function decodePoolError(iface, err) {
   }
 
   return fallback;
+}
+
+async function preflightWithdrawCall(pool, token, args) {
+  try {
+    if (token === "USDT") {
+      await pool.withdrawUsdt.staticCall(...args);
+    } else {
+      await pool.withdraw.staticCall(...args);
+    }
+    return null;
+  } catch (e) {
+    return decodePoolError(pool.interface, e);
+  }
 }
 
 async function handleWithdraw(req, res) {

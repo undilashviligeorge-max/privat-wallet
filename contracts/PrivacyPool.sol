@@ -40,6 +40,8 @@ contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownabl
     uint256 public constant USDT_DENOMINATION = 100 * 1e6;
     /// @notice 0.1 USDT (6 decimals) — aligns with 0.1% competitive framing on 100 USDT notes.
     uint256 public constant PROTOCOL_WITHDRAW_FEE_USDT = 100_000;
+    /// @dev BN254 scalar field modulus (Circom/SnarkJS public signals are reduced modulo this field).
+    uint256 public constant SNARK_SCALAR_FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint32  public constant ASP_ROOT_HISTORY = 64;
 
     IVerifier              public immutable verifier;
@@ -259,9 +261,9 @@ contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownabl
         }
 
         uint256[6] memory publicInputs;
-        publicInputs[0] = uint256(stateRoot);
-        publicInputs[1] = uint256(aspRoot);
-        publicInputs[2] = uint256(nullifierHash);
+        publicInputs[0] = uint256(stateRoot) % SNARK_SCALAR_FIELD;
+        publicInputs[1] = uint256(aspRoot) % SNARK_SCALAR_FIELD;
+        publicInputs[2] = uint256(nullifierHash) % SNARK_SCALAR_FIELD;
         publicInputs[3] = uint256(uint160(address(recipient)));
         publicInputs[4] = uint256(uint160(address(relayer)));
         publicInputs[5] = fee;
@@ -303,9 +305,9 @@ contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownabl
         }
 
         uint256[6] memory publicInputs;
-        publicInputs[0] = uint256(stateRoot);
-        publicInputs[1] = uint256(aspRoot);
-        publicInputs[2] = uint256(nullifierHash);
+        publicInputs[0] = uint256(stateRoot) % SNARK_SCALAR_FIELD;
+        publicInputs[1] = uint256(aspRoot) % SNARK_SCALAR_FIELD;
+        publicInputs[2] = uint256(nullifierHash) % SNARK_SCALAR_FIELD;
         publicInputs[3] = uint256(uint160(recipient));
         publicInputs[4] = uint256(uint160(relayer));
         publicInputs[5] = fee;

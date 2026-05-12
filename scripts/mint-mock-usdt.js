@@ -1,6 +1,6 @@
 import { network } from "hardhat";
 
-const DEFAULT_MOCK_USDT = "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
+const DEFAULT_MOCK_USDT = "0x7F55f82979cb5cFdfe6DAaaDC96eF169EB63C52A";
 /** Whole USDT units (6 decimals applied). Override: MINT_USDT=10000000 */
 const MINT_USDT_WHOLE = (() => {
   const raw = process.env.MINT_USDT?.trim();

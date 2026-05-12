@@ -450,10 +450,10 @@ if (typeof window !== "undefined") {
 /** True only if a real `window.ethereum` existed before the shield stub (not the placeholder). */
 const isMetaMaskInstalled = hadRealEthereumBeforeShield;
 
-const POOL_ADDRESS = "0xdF91714EAC240b6c5AA652669f11Ef1776BbB2a9";
+const POOL_ADDRESS = "0xA53f26482dD78Baac3d1eC84E9a643B89e750145";
 
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
-const MOCK_USDT_ADDRESS = "0xDe1090EbcDb237C5437b81BfCE6663959BED67c0";
+const MOCK_USDT_ADDRESS = "0x7F55f82979cb5cFdfe6DAaaDC96eF169EB63C52A";
 
 /** Must stay in sync with `STATIC_COMPLIANCE_BLOCKLIST` / relayer blocklist. */
 const COMPLIANCE_BLOCKED_ADDRESSES = new Set([
