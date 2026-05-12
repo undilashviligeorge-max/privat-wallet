@@ -33,15 +33,13 @@ function envFirst(...keys) {
   return "";
 }
 
-/** Deployed TelegramPrivacyPool on Sepolia (override with POOL_ADDRESS in .env). */
-const POOL_ADDRESS =
-  process.env.POOL_ADDRESS?.trim() ||
-  "0xA53f26482dD78Baac3d1eC84E9a643B89e750145";
-
-/** Mock ERC20 USDT used by the pool on Sepolia (override with MOCK_USDT_ADDRESS in .env). */
-const MOCK_USDT_ADDRESS =
-  process.env.MOCK_USDT_ADDRESS?.trim() ||
-  "0x7F55f82979cb5cFdfe6DAaaDC96eF169EB63C52A";
+/**
+ * Sepolia — pinned to current deployment. `process.env.POOL_ADDRESS` /
+ * `process.env.MOCK_USDT_ADDRESS` are intentionally ignored so Railway cannot
+ * point the relayer at stale contracts.
+ */
+const POOL_ADDRESS = "0xA53f26482dD78Baac3d1eC84E9a643B89e750145";
+const MOCK_USDT_ADDRESS = "0x7F55f82979cb5cFdfe6DAaaDC96eF169EB63C52A";
 
 /**
  * Static AML / OFAC-style blocklist (lowercase checksummed normalization).
