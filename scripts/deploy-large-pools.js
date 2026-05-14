@@ -1,8 +1,21 @@
 import { network } from "hardhat";
 
 /**
- * Sepolia: MockUSDT, Groth16 verifier + adapter, two MockIncrementalMerkleTree
- * instances (ETH + USDT), TelegramPrivacyPool (dual asset).
+ * Deploy a second TelegramPrivacyPool for the "large" anonymity set:
+ *   1 ETH  +  1000 USDT  (dual-asset, separate Merkle trees)
+ * Protocol fees (consistent ratios with standard pool):
+ *   ETH:  0.1 ETH  (= 10% of 1 ETH note, same ratio as 0.01/0.1)
+ *   USDT: 1 USDT   (= 0.1% of 1000 mock USDT)
+ *
+ * Prerequisites: MockUSDT already deployed. Set in env:
+ *   MOCK_USDT_ADDRESS=0x...
+ *
+ * Reuses Groth16 verifier stack from env when set (saves gas / keeps one verifying key):
+ *   GROTH16_VERIFIER=0x...        (optional)
+ *   GROTH16_VERIFIER_ADAPTER=0x... (optional)
+ * If unset, deploys new Groth16Verifier + Groth16VerifierAdapter like scripts/deploy.js.
+ *
+ * Run (when ready): npx hardhat run scripts/deploy-large-pools.js --network sepolia
  */
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -14,31 +27,41 @@ async function main() {
     .trim()
     .toLowerCase() === "1";
 
-  console.log("Deployer:", deployer.address);
-  console.log(
-    "Balance :",
-    ethers.formatEther(await ethers.provider.getBalance(deployer.address)),
-    "ETH"
-  );
+  const mockUsdtEnv = process.env.MOCK_USDT_ADDRESS?.trim();
+  if (!mockUsdtEnv || !ethers.isAddress(mockUsdtEnv)) {
+    throw new Error("Set MOCK_USDT_ADDRESS to the shared MockUSDT contract.");
+  }
+  const usdtAddr = ethers.getAddress(mockUsdtEnv);
 
-  const usdt = await ethers.deployContract("MockUSDT", [deployer.address]);
-  await usdt.waitForDeployment();
-  const usdtAddr = await usdt.getAddress();
-  console.log("MockUSDT deployed to:                ", usdtAddr);
+  console.log("Deployer:", deployer.address);
+  console.log("Reusing MockUSDT:", usdtAddr);
 
   let groth16Addr = null;
   let verifierAddr;
-  if (useMockVerifier) {
+
+  const adapterEnv = process.env.GROTH16_VERIFIER_ADAPTER?.trim();
+  const groth16Env = process.env.GROTH16_VERIFIER?.trim();
+
+  if (adapterEnv && ethers.isAddress(adapterEnv)) {
+    verifierAddr = ethers.getAddress(adapterEnv);
+    console.log("Reusing Groth16VerifierAdapter:", verifierAddr);
+  } else if (useMockVerifier) {
     const mockVerifier = await ethers.deployContract("MockVerifier");
     await mockVerifier.waitForDeployment();
     verifierAddr = await mockVerifier.getAddress();
     console.log("MockVerifier deployed to:             ", verifierAddr);
+  } else if (groth16Env && ethers.isAddress(groth16Env)) {
+    const g = groth16Env;
+    const verifierAdapter = await ethers.deployContract("Groth16VerifierAdapter", [g]);
+    await verifierAdapter.waitForDeployment();
+    verifierAddr = await verifierAdapter.getAddress();
+    console.log("Groth16Verifier (existing):          ", g);
+    console.log("Groth16VerifierAdapter deployed to:   ", verifierAddr);
   } else {
     const groth16 = await ethers.deployContract("Groth16Verifier");
     await groth16.waitForDeployment();
     groth16Addr = await groth16.getAddress();
     console.log("Groth16Verifier deployed to:          ", groth16Addr);
-
     const verifierAdapter = await ethers.deployContract("Groth16VerifierAdapter", [
       groth16Addr,
     ]);
@@ -64,39 +87,39 @@ async function main() {
     usdtAddr,
     ZERO_ADDRESS,
     deployer.address,
+    ethers.parseEther("1"),
     ethers.parseEther("0.1"),
-    ethers.parseEther("0.01"),
-    100n * 1_000_000n,
-    100_000n,
+    1000n * 1_000_000n,
+    1_000_000n,
   ]);
   await pool.waitForDeployment();
   const poolAddr = await pool.getAddress();
+  console.log("TelegramPrivacyPool (LARGE) deployed:", poolAddr);
 
-  console.log("TelegramPrivacyPool deployed to:      ", poolAddr);
-
-  // Use literal role hash so deploy works on RPCs that block eth_call (e.g. some Tatum tiers).
   const ASP_ROLE = ethers.keccak256(ethers.toUtf8Bytes("ASP_ROLE"));
   await (await pool.grantRole(ASP_ROLE, deployer.address)).wait();
   const aspBootstrapRoot = ethers.keccak256(
-    ethers.toUtf8Bytes("telegram-privacy-pool-asp-bootstrap-v1")
+    ethers.toUtf8Bytes("telegram-privacy-pool-asp-bootstrap-large-v1")
   );
   await (await pool.publishAspRoot(aspBootstrapRoot)).wait();
-  console.log("ASP_ROLE granted to deployer + initial ASP root published:", aspBootstrapRoot);
+  console.log("ASP bootstrap root:", aspBootstrapRoot);
 
-  console.log("\nSummary:");
   console.log(
+    "\nSummary:",
     JSON.stringify(
       {
         network: "sepolia",
-        deployer: deployer.address,
-        verifierMode: useMockVerifier ? "mock" : "groth16-adapter",
-        mockUSDT: usdtAddr,
-        groth16Verifier: groth16Addr,
-        verifier: verifierAddr,
+        largePool: poolAddr,
         ethStateTree: ethTreeAddr,
         usdtStateTree: usdtTreeAddr,
-        sanctionsOracle: ZERO_ADDRESS,
-        pool: poolAddr,
+        mockUSDT: usdtAddr,
+        verifier: verifierAddr,
+        denoms: {
+          eth: "1",
+          protocolEth: "0.1",
+          usdt: "1000",
+          protocolUsdtAtomic: "1000000",
+        },
       },
       null,
       2

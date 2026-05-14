@@ -19,6 +19,7 @@ import {
   MaxUint256,
   keccak256,
   randomBytes,
+  ZeroAddress,
   ZeroHash,
 } from "ethers";
 import { w3mProvider } from "@web3modal/ethereum";
@@ -450,7 +451,16 @@ if (typeof window !== "undefined") {
 /** True only if a real `window.ethereum` existed before the shield stub (not the placeholder). */
 const isMetaMaskInstalled = hadRealEthereumBeforeShield;
 
-const POOL_ADDRESS = "0xA53f26482dD78Baac3d1eC84E9a643B89e750145";
+/**
+ * Denomination keys → pool. Large (1 ETH / 1000 USDT) shares one `TelegramPrivacyPool` deployment.
+ * Keep in sync with `backend/relayer.js`.
+ */
+const POOL_ADDRESSES = Object.freeze({
+  "0.1_ETH": "0xA53f26482dD78Baac3d1eC84E9a643B89e750145",
+  "100_USDT": "0xA53f26482dD78Baac3d1eC84E9a643B89e750145",
+  "1_ETH": "0x5001DD1F346dc789967479BE64aAee5279C7Ea73",
+  "1000_USDT": "0x5001DD1F346dc789967479BE64aAee5279C7Ea73",
+});
 
 /** Sepolia MockUSDT (6 decimals); deployer receives initial supply. */
 const MOCK_USDT_ADDRESS = "0x7F55f82979cb5cFdfe6DAaaDC96eF169EB63C52A";
@@ -655,13 +665,26 @@ function normalizeRelayerFeeAtomic(raw) {
 }
 
 /** Always call immediately before building the witness so the proof binds to the latest server fee. */
-async function fetchWithdrawFeeSnapshot(assetToken) {
+async function fetchWithdrawFeeSnapshot(assetToken, denomKey) {
   const cfg = await fetchFeeConfig();
   const feeWallet = getAddress(cfg.feeWallet);
   const tok = String(assetToken || "ETH").toUpperCase() === "USDT" ? "USDT" : "ETH";
-  const raw = tok === "USDT" ? cfg.relayerFeeUsdt : cfg.relayerFeeEth;
+  const entry = cfg.feesByDenom?.[denomKey];
+  let raw;
+  if (entry?.available && entry.relayerFee != null) {
+    raw = entry.relayerFee;
+  } else if (
+    !cfg.feesByDenom &&
+    (denomKey === "0.1_ETH" || denomKey === "100_USDT")
+  ) {
+    raw = tok === "USDT" ? cfg.relayerFeeUsdt : cfg.relayerFeeEth;
+  } else {
+    throw new Error(
+      `Relayer has no fee data for ${denomKey}. Deploy that pool and set POOL_ADDRESSES, then restart the relayer.`
+    );
+  }
   const feeAtomicStr = normalizeRelayerFeeAtomic(raw);
-  return { feeWallet, feeAtomicStr, cfg, token: tok };
+  return { feeWallet, feeAtomicStr, cfg, token: tok, denomKey };
 }
 
 /**
@@ -689,9 +712,9 @@ async function fetchLatestKnownAspRoot(pool) {
 }
 
 /** Current Merkle root + a known ASP root (required for `withdraw`). */
-async function fetchWithdrawRoots(assetToken) {
+async function fetchWithdrawRoots(assetToken, poolAddress) {
   const provider = new JsonRpcProvider(SEPOLIA_READ_RPC);
-  const pool = new Contract(POOL_ADDRESS, POOL_ABI, provider);
+  const pool = new Contract(poolAddress, POOL_ABI, provider);
   const treeAddr =
     assetToken === "ETH"
       ? await pool.ethStateTree()
@@ -1133,6 +1156,28 @@ const styles = {
     borderBottom: `1px dashed ${theme.border}`,
   },
   rowValue: { color: theme.text, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" },
+  denomRow: {
+    margin: "0 0 14px",
+  },
+  denomSelect: {
+    width: "100%",
+    boxSizing: "border-box",
+    marginTop: 6,
+    padding: "11px 12px",
+    borderRadius: 10,
+    border: `1px solid ${theme.border}`,
+    background: "rgba(0,0,0,0.28)",
+    color: theme.text,
+    fontSize: 13,
+    fontWeight: 600,
+    outline: "none",
+    cursor: "pointer",
+    appearance: "none",
+    backgroundImage: `linear-gradient(45deg, transparent 50%, ${theme.subtle} 50%), linear-gradient(135deg, ${theme.subtle} 50%, transparent 50%)`,
+    backgroundPosition: "calc(100% - 16px) 50%, calc(100% - 11px) 50%",
+    backgroundSize: "5px 5px, 5px 5px",
+    backgroundRepeat: "no-repeat",
+  },
   buttonRow: { display: "flex", gap: 10, marginTop: 18 },
   primary: {
     flex: 1,
@@ -1308,6 +1353,14 @@ function CopyTextButton({ textToCopy, label = "Copy", disabled = false }) {
 }
 
 function TruncatedAddrRow({ label, address }) {
+  if (!address) {
+    return (
+      <div style={styles.row}>
+        <span>{label}</span>
+        <span style={{ ...styles.rowValue, color: theme.subtle }}>Not deployed</span>
+      </div>
+    );
+  }
   const full = getAddress(address);
   return (
     <div style={styles.row}>
@@ -1416,14 +1469,27 @@ function PoolCard() {
   const [burnerWallet, setBurnerWallet] = useState(null);
   const [token, setToken] = useState("ETH");
   const [withdrawSpeed, setWithdrawSpeed] = useState("instant");
-  const [ethDenom, setEthDenom] = useState("0.01");
-  const [ethWithdrawFee, setEthWithdrawFee] = useState("0.001");
-  const [usdtDenom, setUsdtDenom] = useState("100");
-  const [usdtWithdrawFee, setUsdtWithdrawFee] = useState("0.1");
+  const [ethDenomKey, setEthDenomKey] = useState("0.1_ETH");
+  const [usdtDenomKey, setUsdtDenomKey] = useState("100_USDT");
+  const [ethDenom, setEthDenom] = useState("—");
+  const [ethWithdrawFee, setEthWithdrawFee] = useState("—");
+  const [usdtDenom, setUsdtDenom] = useState("—");
+  const [usdtWithdrawFee, setUsdtWithdrawFee] = useState("—");
   const [relayUp, setRelayUp] = useState(null);
   const [showAddUsdtAfterWithdraw, setShowAddUsdtAfterWithdraw] = useState(false);
   const [addTokenBusy, setAddTokenBusy] = useState(false);
   const lastCommitment = useRef(null);
+
+  const denomKey = token === "ETH" ? ethDenomKey : usdtDenomKey;
+  const poolAddress = useMemo(() => {
+    const raw = POOL_ADDRESSES[denomKey];
+    if (!raw || raw === ZeroAddress) return null;
+    try {
+      return getAddress(raw);
+    } catch {
+      return null;
+    }
+  }, [denomKey]);
 
   const walletComplianceBlocked =
     Boolean(address) && isComplianceBlockedAddress(address);
@@ -1485,21 +1551,58 @@ function PoolCard() {
       } catch {
         if (!cancelled) setRelayUp(false);
       }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
       try {
         const provider = new JsonRpcProvider(SEPOLIA_READ_RPC);
-        const pool = new Contract(POOL_ADDRESS, POOL_ABI, provider);
-        const [eD, eP, uD, uP] = await Promise.all([
-          pool.ETH_DENOMINATION(),
-          pool.PROTOCOL_WITHDRAW_FEE_ETH(),
-          pool.USDT_DENOMINATION(),
-          pool.PROTOCOL_WITHDRAW_FEE_USDT(),
-        ]);
+
+        async function loadEthPool() {
+          const raw = POOL_ADDRESSES[ethDenomKey];
+          if (!raw || raw === ZeroAddress) {
+            return { ethD: "—", ethP: "—" };
+          }
+          try {
+            const pool = new Contract(getAddress(raw), POOL_ABI, provider);
+            const [eD, eP] = await Promise.all([
+              pool.ETH_DENOMINATION(),
+              pool.PROTOCOL_WITHDRAW_FEE_ETH(),
+            ]);
+            return { ethD: formatEther(eD), ethP: formatEther(eP) };
+          } catch {
+            return { ethD: "—", ethP: "—" };
+          }
+        }
+
+        async function loadUsdtPool() {
+          const raw = POOL_ADDRESSES[usdtDenomKey];
+          if (!raw || raw === ZeroAddress) {
+            return { usdtD: "—", usdtP: "—" };
+          }
+          try {
+            const pool = new Contract(getAddress(raw), POOL_ABI, provider);
+            const [uD, uP] = await Promise.all([
+              pool.USDT_DENOMINATION(),
+              pool.PROTOCOL_WITHDRAW_FEE_USDT(),
+            ]);
+            return { usdtD: formatUnits(uD, 6), usdtP: formatUnits(uP, 6) };
+          } catch {
+            return { usdtD: "—", usdtP: "—" };
+          }
+        }
+
+        const [ethRow, usdtRow] = await Promise.all([loadEthPool(), loadUsdtPool()]);
         if (cancelled) return;
-        setEthDenom(formatEther(eD));
-        setEthWithdrawFee(formatEther(eP));
-        setUsdtDenom(formatUnits(uD, 6));
-        setUsdtWithdrawFee(formatUnits(uP, 6));
+        setEthDenom(ethRow.ethD);
+        setEthWithdrawFee(ethRow.ethP);
+        setUsdtDenom(usdtRow.usdtD);
+        setUsdtWithdrawFee(usdtRow.usdtP);
       } catch {
         /* RPC hiccup */
       }
@@ -1507,7 +1610,7 @@ function PoolCard() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [ethDenomKey, usdtDenomKey]);
 
   useEffect(() => {
     void getGroth16ArtifactsCached("[preload]")
@@ -1694,6 +1797,14 @@ function PoolCard() {
       return;
     }
     if (!address) return;
+    if (!poolAddress) {
+      setStatus({
+        kind: "error",
+        text:
+          "This denomination has no deployed pool yet. Run deploy-large-pools, paste `largePool` into POOL_ADDRESSES (frontend + relayer), bootstrap ASP for that address, then retry.",
+      });
+      return;
+    }
 
     setDepositBusy(true);
     setShowAddUsdtAfterWithdraw(false);
@@ -1751,10 +1862,10 @@ function PoolCard() {
 
       let pool;
       try {
-        pool = new Contract(POOL_ADDRESS, POOL_ABI, signer);
-        console.log("[deposit] Step F: contract instance for pool", POOL_ADDRESS);
+        pool = new Contract(poolAddress, POOL_ABI, signer);
+        console.log("[deposit] Step F: contract instance for pool", poolAddress);
       } catch (e) {
-        throw new Error(formatDepositFailure("Contract(POOL_ADDRESS)", e));
+        throw new Error(formatDepositFailure("Contract(poolAddress)", e));
       }
 
       if (token === "ETH") {
@@ -1807,7 +1918,7 @@ function PoolCard() {
         const usdt = new Contract(MOCK_USDT_ADDRESS, ERC20_ABI, signer);
         let allowance;
         try {
-          allowance = await usdt.allowance(address, POOL_ADDRESS);
+          allowance = await usdt.allowance(address, poolAddress);
           console.log("[deposit] allowance vs required", allowance.toString(), amount.toString());
         } catch (e) {
           throw new Error(formatDepositFailure("usdt.allowance", e));
@@ -1816,7 +1927,7 @@ function PoolCard() {
         if (allowance < amount) {
           setStatus({ kind: "info", text: "Approving Mock USDT…" });
           try {
-            const txA = await usdt.approve(POOL_ADDRESS, MaxUint256);
+            const txA = await usdt.approve(poolAddress, MaxUint256);
             console.log("[deposit] approve tx", txA.hash);
             await txA.wait();
           } catch (e) {
@@ -1871,6 +1982,8 @@ function PoolCard() {
       depositBusy,
       withdrawBusy,
       token,
+      denomKey,
+      poolAddress,
       withdrawSpeed,
       commitment: lastCommitment.current,
     });
@@ -1898,6 +2011,14 @@ function PoolCard() {
       setStatus({ kind: "error", text: COMPLIANCE_BLOCKED_MESSAGE });
       return;
     }
+    if (!poolAddress) {
+      setStatus({
+        kind: "error",
+        text:
+          "This denomination has no deployed pool on Sepolia. Deploy large pools and update POOL_ADDRESSES first.",
+      });
+      return;
+    }
 
     setWithdrawBusy(true);
     setShowAddUsdtAfterWithdraw(false);
@@ -1910,7 +2031,7 @@ function PoolCard() {
       console.log("[withdraw] Step 1: loading artifacts + roots");
       const [{ wasmBytes, zkeyBytes }, roots] = await Promise.all([
         getGroth16ArtifactsCached("[withdraw][zk]"),
-        fetchWithdrawRoots(token),
+        fetchWithdrawRoots(token, poolAddress),
       ]);
 
       const { stateRoot, aspRoot } = roots;
@@ -1926,7 +2047,10 @@ function PoolCard() {
       const nullifierHash = keccak256(randomBytes(32));
 
       async function buildProofAndRelay() {
-        const { feeWallet, feeAtomicStr } = await fetchWithdrawFeeSnapshot(token);
+        const { feeWallet, feeAtomicStr } = await fetchWithdrawFeeSnapshot(
+          token,
+          denomKey
+        );
 
         const witness = buildPoolPublicBindWitness({
           stateRootHex: stateRoot,
@@ -1947,6 +2071,7 @@ function PoolCard() {
           feeAtomicStr,
           feeWallet,
           token,
+          denomKey,
         });
 
         const zkBundle = await generateWithdrawBindingProof(
@@ -1965,6 +2090,7 @@ function PoolCard() {
           recipient: withdrawRecipient,
           commitment: lastCommitment.current ?? null,
           token,
+          denomKey,
           withdrawSpeed,
           fee: feeAtomicStr,
           proof: zkBundle.proofHex,
@@ -2078,8 +2204,9 @@ function PoolCard() {
     }
   }
 
-  const depositLabel =
-    token === "ETH"
+  const depositLabel = !poolAddress
+    ? "—"
+    : token === "ETH"
       ? `${ethDenom} ETH`
       : `${usdtDenom} USDT`;
 
@@ -2101,6 +2228,55 @@ function PoolCard() {
         </button>
       </div>
 
+      <div style={styles.segmentLabel}>Note size (fixed denomination)</div>
+      <div style={styles.denomRow}>
+        {token === "ETH" ? (
+          <select
+            aria-label="ETH note size"
+            style={styles.denomSelect}
+            value={ethDenomKey}
+            onChange={(e) => setEthDenomKey(e.target.value)}
+          >
+            <option value="0.1_ETH">0.1 ETH</option>
+            <option value="1_ETH">1 ETH</option>
+          </select>
+        ) : (
+          <select
+            aria-label="USDT note size"
+            style={styles.denomSelect}
+            value={usdtDenomKey}
+            onChange={(e) => setUsdtDenomKey(e.target.value)}
+          >
+            <option value="100_USDT">100 USDT</option>
+            <option value="1000_USDT">1000 USDT</option>
+          </select>
+        )}
+      </div>
+
+      {!poolAddress ? (
+        <p
+          style={{
+            margin: "0 0 14px",
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1px solid rgba(251,191,36,0.45)",
+            background: "rgba(251,191,36,0.08)",
+            color: "#fbbf24",
+            fontSize: 13,
+            fontWeight: 600,
+            lineHeight: 1.45,
+          }}
+        >
+          This note size uses its own pool contract. Deploy it (e.g.{" "}
+          <span style={{ fontFamily: "ui-monospace, monospace" }}>
+            scripts/deploy-large-pools.js
+          </span>
+          ), paste the address into{" "}
+          <span style={{ fontFamily: "ui-monospace, monospace" }}>POOL_ADDRESSES</span> in
+          the frontend and relayer, publish an ASP root for that pool, then reload.
+        </p>
+      ) : null}
+
       <p
         style={{
           margin: "0 0 14px",
@@ -2110,14 +2286,18 @@ function PoolCard() {
           lineHeight: 1.4,
         }}
       >
-        Protocol withdraw fee: {ethWithdrawFee} ETH · {usdtWithdrawFee} USDT (per withdrawal, not on deposit)
+        {token === "ETH" ? (
+          <>Protocol withdraw fee (selected ETH pool): {ethWithdrawFee} ETH</>
+        ) : (
+          <>Protocol withdraw fee (selected USDT pool): {usdtWithdrawFee} USDT</>
+        )}
       </p>
 
       <div style={styles.row}>
         <span>Network</span>
         <span style={styles.rowValue}>Sepolia</span>
       </div>
-      <TruncatedAddrRow label="Pool" address={POOL_ADDRESS} />
+      <TruncatedAddrRow label="Pool (this note size)" address={poolAddress} />
       <TruncatedAddrRow label="USDT (mock)" address={MOCK_USDT_ADDRESS} />
 
       {walletComplianceBlocked ? (
@@ -2206,7 +2386,8 @@ function PoolCard() {
             depositBusy ||
             withdrawBusy ||
             connectBusy ||
-            walletComplianceBlocked
+            walletComplianceBlocked ||
+            !poolAddress
           }
         >
           {connectBusy
@@ -2226,7 +2407,8 @@ function PoolCard() {
             withdrawBusy ||
             depositBusy ||
             connectBusy ||
-            walletComplianceBlocked
+            walletComplianceBlocked ||
+            !poolAddress
           }
         >
           {connectBusy ? "Connecting Wallet…" : "Withdraw"}
@@ -2476,7 +2658,14 @@ export default function TelegramMixerApp() {
             Connect a Sepolia wallet to deposit. Withdrawals are routed through
             the relayer for privacy.
             <br />
-            Pool: <span style={{ color: theme.text }}>{POOL_ADDRESS}</span>
+            <span style={{ color: theme.subtle, fontSize: 12, lineHeight: 1.5 }}>
+              0.1 ETH / 1 ETH and 100 USDT / 1000 USDT use separate pool contracts for
+              anonymity. The card above shows the address for your selected note size (
+              <span style={{ fontFamily: "ui-monospace, monospace" }}>
+                POOL_ADDRESSES
+              </span>{" "}
+              in code).
+            </span>
           </div>
         </div>
         <WalletConnectOverlay

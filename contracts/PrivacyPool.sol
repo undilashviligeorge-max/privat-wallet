@@ -27,6 +27,7 @@ interface ISanctionsList {
 }
 
 /// @notice Dual-asset privacy pool: native ETH and ERC20 USDT with separate Merkle trees.
+///         Denominations and protocol fees are fixed at deployment (one anonymity set per pool).
 contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownable {
     using EnumerableSet for EnumerableSet.AddressSet;
     using SafeERC20 for IERC20;
@@ -35,11 +36,10 @@ contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownabl
     bytes32 public constant COMPLIANCE_ROLE = keccak256("COMPLIANCE_ROLE");
     bytes32 public constant PAUSER_ROLE     = keccak256("PAUSER_ROLE");
 
-    uint256 public constant ETH_DENOMINATION = 0.01 ether;
-    uint256 public constant PROTOCOL_WITHDRAW_FEE_ETH = 0.001 ether;
-    uint256 public constant USDT_DENOMINATION = 100 * 1e6;
-    /// @notice 0.1 USDT (6 decimals) — aligns with 0.1% competitive framing on 100 USDT notes.
-    uint256 public constant PROTOCOL_WITHDRAW_FEE_USDT = 100_000;
+    uint256 public immutable ETH_DENOMINATION;
+    uint256 public immutable PROTOCOL_WITHDRAW_FEE_ETH;
+    uint256 public immutable USDT_DENOMINATION;
+    uint256 public immutable PROTOCOL_WITHDRAW_FEE_USDT;
     /// @dev BN254 scalar field modulus (Circom/SnarkJS public signals are reduced modulo this field).
     uint256 public constant SNARK_SCALAR_FIELD = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint32  public constant ASP_ROOT_HISTORY = 64;
@@ -107,19 +107,33 @@ contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownabl
     error ZeroAddress();
     error ZeroRoot();
 
+    error InvalidDenomConfig();
+
     constructor(
         IVerifier              _verifier,
         IIncrementalMerkleTree _ethStateTree,
         IIncrementalMerkleTree _usdtStateTree,
         IERC20                 _usdt,
         ISanctionsList         _sanctionsOracle,
-        address                admin
+        address                admin,
+        uint256                ethDenomination_,
+        uint256                protocolWithdrawFeeEth_,
+        uint256                usdtDenomination_,
+        uint256                protocolWithdrawFeeUsdt_
     ) Ownable(admin) {
         if (address(_verifier)      == address(0)) revert ZeroAddress();
         if (address(_ethStateTree)  == address(0)) revert ZeroAddress();
         if (address(_usdtStateTree) == address(0)) revert ZeroAddress();
         if (address(_usdt)          == address(0)) revert ZeroAddress();
         if (admin                   == address(0)) revert ZeroAddress();
+        if (ethDenomination_ == 0 || usdtDenomination_ == 0) revert InvalidDenomConfig();
+        if (protocolWithdrawFeeEth_ >= ethDenomination_) revert InvalidDenomConfig();
+        if (protocolWithdrawFeeUsdt_ >= usdtDenomination_) revert InvalidDenomConfig();
+
+        ETH_DENOMINATION = ethDenomination_;
+        PROTOCOL_WITHDRAW_FEE_ETH = protocolWithdrawFeeEth_;
+        USDT_DENOMINATION = usdtDenomination_;
+        PROTOCOL_WITHDRAW_FEE_USDT = protocolWithdrawFeeUsdt_;
 
         verifier        = _verifier;
         ethStateTree    = _ethStateTree;
@@ -188,11 +202,11 @@ contract TelegramPrivacyPool is AccessControl, Pausable, ReentrancyGuard, Ownabl
     function pause()   external onlyRole(PAUSER_ROLE) { _pause();   }
     function unpause() external onlyRole(PAUSER_ROLE) { _unpause(); }
 
-    function depositAmountRequired() external pure returns (uint256) {
+    function depositAmountRequired() external view returns (uint256) {
         return ETH_DENOMINATION;
     }
 
-    function usdtDepositAmountRequired() external pure returns (uint256) {
+    function usdtDepositAmountRequired() external view returns (uint256) {
         return USDT_DENOMINATION;
     }
 

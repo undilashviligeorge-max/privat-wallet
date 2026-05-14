@@ -31,7 +31,8 @@ async function main() {
   console.log("RELAY_URL:", base);
   console.log("HTTP:", res.status, res.ok);
   if (j && typeof j === "object") {
-    console.log("POOL_ADDRESS (from JSON pool):", j.pool ?? "(missing)");
+    console.log("poolAddresses:", j.poolAddresses ?? "(missing)");
+    console.log("feesByDenom keys:", j.feesByDenom ? Object.keys(j.feesByDenom) : "(missing)");
     console.log("MOCK_USDT_ADDRESS:", j.mockUsdt ?? "(missing)");
   } else {
     console.log("Body:", text?.slice(0, 500));

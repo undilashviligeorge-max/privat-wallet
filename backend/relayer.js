@@ -34,12 +34,23 @@ function envFirst(...keys) {
 }
 
 /**
- * Sepolia — pinned to current deployment. `process.env.POOL_ADDRESS` /
- * `process.env.MOCK_USDT_ADDRESS` are intentionally ignored so Railway cannot
- * point the relayer at stale contracts.
+ * Sepolia — pinned MockUSDT. (Pool addresses vary by denomination key.)
  */
-const POOL_ADDRESS = "0xA53f26482dD78Baac3d1eC84E9a643B89e750145";
 const MOCK_USDT_ADDRESS = "0x7F55f82979cb5cFdfe6DAaaDC96eF169EB63C52A";
+
+/**
+ * User-facing denomination keys → pool. Large (1 ETH / 1000 USDT) shares one deployment.
+ * Keys must stay in sync with `frontend/src/App.jsx` `POOL_ADDRESSES`.
+ */
+const POOL_ADDRESSES_BY_DENOM_KEY = Object.freeze({
+  "0.1_ETH": "0xA53f26482dD78Baac3d1eC84E9a643B89e750145",
+  "100_USDT": "0xA53f26482dD78Baac3d1eC84E9a643B89e750145",
+  "1_ETH": "0x5001DD1F346dc789967479BE64aAee5279C7Ea73",
+  "1000_USDT": "0x5001DD1F346dc789967479BE64aAee5279C7Ea73",
+});
+
+/** Keep in sync with frontend `POOL_ADDRESSES` keys. */
+const ALL_DENOM_KEYS = Object.freeze(["0.1_ETH", "1_ETH", "100_USDT", "1000_USDT"]);
 
 /**
  * Static AML / OFAC-style blocklist (lowercase checksummed normalization).
@@ -106,15 +117,9 @@ function sanctionsComplianceMiddleware(req, res, next) {
   next();
 }
 
-/** Must match `TelegramPrivacyPool` constants (used to compute relayer fee from FEE_PERCENTAGE). */
-const POOL_DENOMS = Object.freeze({
-  ETH_WEI: 10n ** 16n, // 0.01 ether
-  PROTOCOL_ETH_WEI: 10n ** 15n, // 0.001 ether
-  USDT: 100n * 1_000_000n, // 100 * 1e6
-  PROTOCOL_USDT: 100_000n, // 0.1 USDT (6 decimals) — must match `TelegramPrivacyPool.PROTOCOL_WITHDRAW_FEE_USDT`
-});
-
+/** Must match `TelegramPrivacyPool` withdrawal / errors. */
 const POOL_ABI = [
+  "error InvalidDenomConfig()",
   "error NullifierAlreadyUsed()",
   "error FeeExceedsDenomination()",
   "error ZeroAddress()",
@@ -131,6 +136,57 @@ const POOL_ABI = [
   "function withdraw(bytes proof, bytes32 stateRoot, bytes32 aspRoot, bytes32 nullifierHash, address payable recipient, address payable relayer, uint256 fee) external",
   "function withdrawUsdt(bytes proof, bytes32 stateRoot, bytes32 aspRoot, bytes32 nullifierHash, address recipient, address relayer, uint256 fee) external",
 ];
+
+const POOL_DENOMS_READ_ABI = [
+  "function ETH_DENOMINATION() view returns (uint256)",
+  "function PROTOCOL_WITHDRAW_FEE_ETH() view returns (uint256)",
+  "function USDT_DENOMINATION() view returns (uint256)",
+  "function PROTOCOL_WITHDRAW_FEE_USDT() view returns (uint256)",
+];
+
+const poolDenomsCache = new Map();
+const DENOM_KEYS = new Set(ALL_DENOM_KEYS);
+
+async function readPoolDenoms(poolAddr) {
+  const k = ethers.getAddress(poolAddr).toLowerCase();
+  if (poolDenomsCache.has(k)) return poolDenomsCache.get(k);
+  const c = new ethers.Contract(poolAddr, POOL_DENOMS_READ_ABI, provider);
+  const [ETH_WEI, PROTOCOL_ETH_WEI, USDT_ATOMIC, PROTOCOL_USDT] = await Promise.all([
+    c.ETH_DENOMINATION(),
+    c.PROTOCOL_WITHDRAW_FEE_ETH(),
+    c.USDT_DENOMINATION(),
+    c.PROTOCOL_WITHDRAW_FEE_USDT(),
+  ]);
+  const row = { ETH_WEI, PROTOCOL_ETH_WEI, USDT_ATOMIC, PROTOCOL_USDT };
+  poolDenomsCache.set(k, row);
+  return row;
+}
+
+function normalizeDenomKey(raw) {
+  const key = String(raw ?? "").trim();
+  return DENOM_KEYS.has(key) ? key : null;
+}
+
+function resolvePoolAddressForDenomKey(denomKey) {
+  const addr = POOL_ADDRESSES_BY_DENOM_KEY[denomKey];
+  if (!addr || addr === ethers.ZeroAddress) return null;
+  return ethers.getAddress(addr);
+}
+
+function denomKeyMatchesToken(token, denomKey) {
+  if (token === "ETH") return denomKey === "0.1_ETH" || denomKey === "1_ETH";
+  return denomKey === "100_USDT" || denomKey === "1000_USDT";
+}
+
+function defaultDenomKeyForToken(token) {
+  return token === "ETH" ? "0.1_ETH" : "100_USDT";
+}
+
+function effectiveDenomKey(token, bodyDenomKey) {
+  const normalized = normalizeDenomKey(bodyDenomKey);
+  if (normalized && denomKeyMatchesToken(token, normalized)) return normalized;
+  return defaultDenomKeyForToken(token);
+}
 
 /**
  * Integration-test stand-in for 12h / 24h queues. Logs label the real SLA; timers stay short locally.
@@ -219,22 +275,22 @@ function ceilDiv(a, b) {
 }
 
 /** Max pool payout to relayer + recipient slice (denomination − protocol fee). */
-function maxRelayerFeeForToken(token) {
+function maxRelayerFeeForDenoms(token, denoms) {
   if (token === "USDT") {
-    return POOL_DENOMS.USDT - POOL_DENOMS.PROTOCOL_USDT;
+    return denoms.USDT_ATOMIC - denoms.PROTOCOL_USDT;
   }
-  return POOL_DENOMS.ETH_WEI - POOL_DENOMS.PROTOCOL_ETH_WEI;
+  return denoms.ETH_WEI - denoms.PROTOCOL_ETH_WEI;
 }
 
 /**
  * Pure profit: FEE_PERCENTAGE of the full on-chain note size (gross denomination).
  */
-function computeProfitFee(token, feePercentage = parseFeePercentage()) {
+function computeProfitFeeForDenoms(token, denoms, feePercentage = parseFeePercentage()) {
   const bps = feePercentToBps(feePercentage);
   if (token === "USDT") {
-    return (POOL_DENOMS.USDT * bps) / 10_000n;
+    return (denoms.USDT_ATOMIC * bps) / 10_000n;
   }
-  return (POOL_DENOMS.ETH_WEI * bps) / 10_000n;
+  return (denoms.ETH_WEI * bps) / 10_000n;
 }
 
 /**
@@ -299,8 +355,13 @@ async function estimateWithdrawGasCostWei(token) {
  * ETH path adds wei gas estimate; USDT path is profit-only so relayer fee stays exactly that percentage (relayer pays gas in ETH).
  * Capped so fee + protocol ≤ denomination (must match deployed `TelegramPrivacyPool` constants).
  */
-async function computeRelayerFeeDetails(token, feePercentage = parseFeePercentage()) {
-  const profit = computeProfitFee(token, feePercentage);
+async function computeRelayerFeeDetails(
+  token,
+  poolAddr,
+  feePercentage = parseFeePercentage()
+) {
+  const denoms = await readPoolDenoms(poolAddr);
+  const profit = computeProfitFeeForDenoms(token, denoms, feePercentage);
   const gasWei = await estimateWithdrawGasCostWei(token);
   let gasCoverageInToken;
   let combined;
@@ -311,11 +372,12 @@ async function computeRelayerFeeDetails(token, feePercentage = parseFeePercentag
     gasCoverageInToken = gasWei;
     combined = profit + gasWei;
   }
-  const cap = maxRelayerFeeForToken(token);
+  const cap = maxRelayerFeeForDenoms(token, denoms);
   const capped = combined > cap;
   if (capped) {
     console.warn("[relayer] relayer fee exceeds max allowed by pool; capping", {
       token,
+      poolAddr,
       combined: combined.toString(),
       cap: cap.toString(),
     });
@@ -334,9 +396,40 @@ async function computeRelayerFeeDetails(token, feePercentage = parseFeePercentag
   };
 }
 
-async function computeRelayerFeeForToken(token, feePercentage = parseFeePercentage()) {
-  const { total } = await computeRelayerFeeDetails(token, feePercentage);
+async function computeRelayerFeeForToken(token, poolAddr, feePercentage = parseFeePercentage()) {
+  const { total } = await computeRelayerFeeDetails(token, poolAddr, feePercentage);
   return total;
+}
+
+async function buildFeeEntryForDenomKey(denomKey, feePercentage) {
+  const poolAddr = resolvePoolAddressForDenomKey(denomKey);
+  const token = denomKey.endsWith("_ETH") ? "ETH" : "USDT";
+  if (!poolAddr) {
+    return {
+      denomKey,
+      available: false,
+      token,
+      pool: null,
+      relayerFee: null,
+      breakdown: null,
+    };
+  }
+  const details = await computeRelayerFeeDetails(token, poolAddr, feePercentage);
+  return {
+    denomKey,
+    available: true,
+    token,
+    pool: poolAddr,
+    relayerFee: details.total.toString(),
+    breakdown: details.breakdown,
+  };
+}
+
+async function buildFeesByDenomMap(feePercentage = parseFeePercentage()) {
+  const entries = await Promise.all(
+    ALL_DENOM_KEYS.map((k) => buildFeeEntryForDenomKey(k, feePercentage))
+  );
+  return Object.fromEntries(entries.map((e) => [e.denomKey, e]));
 }
 
 let cachedFeeWallet = null;
@@ -470,18 +563,34 @@ function toBytes32(value, label) {
  * @param {string} p.token "ETH" | "USDT"
  */
 async function tryBroadcastWithdraw(p) {
-  const { recipient, token, proof, stateRoot, aspRoot, nullifierHash, fee } = p;
+  const {
+    recipient,
+    token,
+    proof,
+    stateRoot,
+    aspRoot,
+    nullifierHash,
+    fee,
+    poolAddress,
+    denomKey,
+  } = p;
+
+  if (!poolAddress) {
+    const msg = "No pool address resolved for this denomination; deploy the pool or set POOL_ADDRESSES.";
+    console.warn("[relayer]", msg, { token, recipient, denomKey });
+    return { success: false, message: msg, token, pool: null, denomKey };
+  }
 
   if (!hasFullZkBundle({ proof, stateRoot, aspRoot, nullifierHash, fee })) {
     const msg =
       "ZK bundle incomplete (need proof, stateRoot, aspRoot, nullifierHash, fee); on-chain withdraw not broadcast";
-    console.warn("[relayer]", msg, { token, recipient, mockUsdt: MOCK_USDT_ADDRESS });
-    return { success: false, message: msg, token, pool: POOL_ADDRESS };
+    console.warn("[relayer]", msg, { token, recipient, mockUsdt: MOCK_USDT_ADDRESS, pool: poolAddress });
+    return { success: false, message: msg, token, pool: poolAddress, denomKey };
   }
 
-  const pool = new ethers.Contract(POOL_ADDRESS, POOL_ABI, relayerWallet);
+  const pool = new ethers.Contract(poolAddress, POOL_ABI, relayerWallet);
   const feeWallet = await resolveFeeWalletAddress();
-  const expectedRelayerFee = await computeRelayerFeeForToken(token);
+  const expectedRelayerFee = await computeRelayerFeeForToken(token, poolAddress);
   const proofBytes = toProofBytes(proof);
   const sr = toBytes32(stateRoot, "stateRoot");
   const ar = toBytes32(aspRoot, "aspRoot");
@@ -495,7 +604,8 @@ async function tryBroadcastWithdraw(p) {
       success: false,
       message: msg,
       token,
-      pool: POOL_ADDRESS,
+      pool: poolAddress,
+      denomKey,
       mockUsdt: token === "USDT" ? MOCK_USDT_ADDRESS : undefined,
       expectedRelayerFee: expectedRelayerFee.toString(),
       feeWallet,
@@ -511,7 +621,8 @@ async function tryBroadcastWithdraw(p) {
         success: false,
         message: preflightError,
         token,
-        pool: POOL_ADDRESS,
+        pool: poolAddress,
+        denomKey,
         mockUsdt: token === "USDT" ? MOCK_USDT_ADDRESS : undefined,
         preflight: true,
       };
@@ -520,13 +631,15 @@ async function tryBroadcastWithdraw(p) {
     if (token === "USDT") {
       console.log(
         "[relayer] Broadcasting withdrawUsdt → pool",
-        POOL_ADDRESS,
+        poolAddress,
         "MOCK_USDT",
         MOCK_USDT_ADDRESS,
         "feeWallet",
         feeWallet,
         "relayerFee",
-        feeBn.toString()
+        feeBn.toString(),
+        "denomKey",
+        denomKey
       );
       const tx = await pool.withdrawUsdt(...txArgs);
       const receipt = await tx.wait();
@@ -536,18 +649,21 @@ async function tryBroadcastWithdraw(p) {
         message: "USDT withdrawal confirmed",
         txHash: receipt.hash,
         token: "USDT",
-        pool: POOL_ADDRESS,
+        pool: poolAddress,
+        denomKey,
         mockUsdt: MOCK_USDT_ADDRESS,
       };
     }
 
     console.log(
       "[relayer] Broadcasting withdraw (ETH) → pool",
-      POOL_ADDRESS,
+      poolAddress,
       "feeWallet",
       feeWallet,
       "relayerFee",
-      feeBn.toString()
+      feeBn.toString(),
+      "denomKey",
+      denomKey
     );
     const tx = await pool.withdraw(...txArgs);
     const receipt = await tx.wait();
@@ -557,7 +673,8 @@ async function tryBroadcastWithdraw(p) {
       message: "ETH withdrawal confirmed",
       txHash: receipt.hash,
       token: "ETH",
-      pool: POOL_ADDRESS,
+      pool: poolAddress,
+      denomKey,
     };
   } catch (e) {
     const msg = decodePoolError(pool.interface, e);
@@ -566,7 +683,8 @@ async function tryBroadcastWithdraw(p) {
       success: false,
       message: msg,
       token,
-      pool: POOL_ADDRESS,
+      pool: poolAddress,
+      denomKey,
       mockUsdt: token === "USDT" ? MOCK_USDT_ADDRESS : undefined,
     };
   }
@@ -651,12 +769,23 @@ async function handleWithdraw(req, res) {
     const token = normalizeToken(rawToken);
     const withdrawSpeed = normalizeWithdrawSpeed(rawSpeed);
     const delayMs = queueDelayMs(withdrawSpeed);
+    const denomKey = effectiveDenomKey(token, body.denomKey);
+    const poolAddress = resolvePoolAddressForDenomKey(denomKey);
+    if (!poolAddress) {
+      res.status(400).json({
+        success: false,
+        message: `Pool not deployed for denomination ${denomKey}. Run deploy-large-pools and set POOL_ADDRESSES (frontend + relayer).`,
+      });
+      return;
+    }
 
     const payload = {
       recipient: recipientNorm,
       commitment: commitment ?? null,
       token,
       withdrawSpeed,
+      denomKey,
+      poolAddress,
       proof,
       stateRoot,
       aspRoot,
@@ -681,7 +810,8 @@ async function handleWithdraw(req, res) {
           token,
           withdrawSpeed,
           commitment: commitment ?? null,
-          pool: POOL_ADDRESS,
+          pool: poolAddress,
+          denomKey,
           ...(token === "USDT" ? { mockUsdt: MOCK_USDT_ADDRESS } : {}),
           stagingNote: result.message,
         });
@@ -713,7 +843,8 @@ async function handleWithdraw(req, res) {
       withdrawSpeed,
       token,
       commitment: commitment ?? null,
-      pool: POOL_ADDRESS,
+      pool: poolAddress,
+      denomKey,
       ...(token === "USDT" ? { mockUsdt: MOCK_USDT_ADDRESS } : {}),
     });
   } catch (e) {
@@ -727,9 +858,12 @@ app.get("/relayer-address", async (_req, res) => {
   try {
     const signer = await relayerWallet.getAddress();
     const pct = parseFeePercentage();
+    const feesByDenom = await buildFeesByDenomMap(pct);
+    const poolEth = resolvePoolAddressForDenomKey("0.1_ETH");
+    const poolUsdt = resolvePoolAddressForDenomKey("100_USDT");
     const [relayerFeeEth, relayerFeeUsdt] = await Promise.all([
-      computeRelayerFeeForToken("ETH", pct),
-      computeRelayerFeeForToken("USDT", pct),
+      poolEth ? computeRelayerFeeForToken("ETH", poolEth, pct) : 0n,
+      poolUsdt ? computeRelayerFeeForToken("USDT", poolUsdt, pct) : 0n,
     ]);
     res.json({
       success: true,
@@ -739,6 +873,8 @@ app.get("/relayer-address", async (_req, res) => {
       feePercentage: pct,
       relayerFeeEth: relayerFeeEth.toString(),
       relayerFeeUsdt: relayerFeeUsdt.toString(),
+      poolAddresses: { ...POOL_ADDRESSES_BY_DENOM_KEY },
+      feesByDenom,
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e?.message || String(e) });
@@ -750,9 +886,12 @@ app.get("/fee-config", async (_req, res) => {
   try {
     const signer = await relayerWallet.getAddress();
     const pct = parseFeePercentage();
+    const feesByDenom = await buildFeesByDenomMap(pct);
+    const poolEth = resolvePoolAddressForDenomKey("0.1_ETH");
+    const poolUsdt = resolvePoolAddressForDenomKey("100_USDT");
     const [ethDetails, usdtDetails] = await Promise.all([
-      computeRelayerFeeDetails("ETH", pct),
-      computeRelayerFeeDetails("USDT", pct),
+      poolEth ? computeRelayerFeeDetails("ETH", poolEth, pct) : Promise.resolve({ total: 0n, breakdown: null }),
+      poolUsdt ? computeRelayerFeeDetails("USDT", poolUsdt, pct) : Promise.resolve({ total: 0n, breakdown: null }),
     ]);
     res.json({
       success: true,
@@ -763,6 +902,8 @@ app.get("/fee-config", async (_req, res) => {
       relayerFeeUsdt: usdtDetails.total.toString(),
       breakdownEth: ethDetails.breakdown,
       breakdownUsdt: usdtDetails.breakdown,
+      poolAddresses: { ...POOL_ADDRESSES_BY_DENOM_KEY },
+      feesByDenom,
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e?.message || String(e) });
@@ -793,14 +934,18 @@ app.post("/relay", async (req, res) => {
     }
     const signer = await relayerWallet.getAddress();
     const pct = parseFeePercentage();
+    const feesByDenom = await buildFeesByDenomMap(pct);
+    const poolEth = resolvePoolAddressForDenomKey("0.1_ETH");
+    const poolUsdt = resolvePoolAddressForDenomKey("100_USDT");
     const [relayerFeeEth, relayerFeeUsdt] = await Promise.all([
-      computeRelayerFeeForToken("ETH", pct),
-      computeRelayerFeeForToken("USDT", pct),
+      poolEth ? computeRelayerFeeForToken("ETH", poolEth, pct) : 0n,
+      poolUsdt ? computeRelayerFeeForToken("USDT", poolUsdt, pct) : 0n,
     ]);
     res.json({
       success: true,
       message: "Relayer endpoint active",
-      pool: POOL_ADDRESS,
+      poolAddresses: { ...POOL_ADDRESSES_BY_DENOM_KEY },
+      feesByDenom,
       mockUsdt: MOCK_USDT_ADDRESS,
       relayerAddress: signer,
       feeWallet: await resolveFeeWalletAddress(),
@@ -822,7 +967,7 @@ app.use((err, _req, res, _next) => {
 });
 
 async function logStartupDetails() {
-  console.log("Pool:", POOL_ADDRESS);
+  console.log("Pools (by denom key):", { ...POOL_ADDRESSES_BY_DENOM_KEY });
   console.log("Mock USDT:", MOCK_USDT_ADDRESS);
   console.log("CORS: permissive (reflect request Origin; credentials=false)");
   if (relayerWallet) {
@@ -840,12 +985,14 @@ async function logStartupDetails() {
   console.log("FEE_PERCENTAGE:", pct, "% (USDT: profit-only relayer fee; ETH: profit + gas wei)");
   if (relayerWallet) {
     try {
+      const pE = resolvePoolAddressForDenomKey("0.1_ETH");
+      const pU = resolvePoolAddressForDenomKey("100_USDT");
       const [fEth, fUsdt] = await Promise.all([
-        computeRelayerFeeForToken("ETH", pct),
-        computeRelayerFeeForToken("USDT", pct),
+        pE ? computeRelayerFeeForToken("ETH", pE, pct) : 0n,
+        pU ? computeRelayerFeeForToken("USDT", pU, pct) : 0n,
       ]);
-      console.log("Sample relayer fee ETH wei:", fEth.toString());
-      console.log("Sample relayer fee USDT atomic:", fUsdt.toString());
+      console.log("Sample relayer fee (0.1_ETH pool) wei:", fEth.toString());
+      console.log("Sample relayer fee (100_USDT pool) atomic:", fUsdt.toString());
     } catch (e) {
       console.warn("[relayer] could not precompute fees:", e?.message || e);
     }
