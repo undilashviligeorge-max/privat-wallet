@@ -2,6 +2,8 @@ import { ethers } from "ethers";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
 
@@ -454,12 +456,62 @@ async function resolveFeeWalletAddress() {
   return cachedFeeWallet;
 }
 
+/**
+ * Exact browser origins allowed to call this API (comma-separated).
+ * Example Railway env: RELAYER_ALLOWED_ORIGINS=https://your-app.vercel.app,http://localhost:5173
+ */
+function parseAllowedOriginsFromEnv() {
+  const raw = process.env.RELAYER_ALLOWED_ORIGINS?.trim();
+  if (!raw) return [];
+  return raw
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      try {
+        return new URL(entry).origin;
+      } catch {
+        return entry.replace(/\/+$/, "");
+      }
+    })
+    .filter(Boolean);
+}
+
+const ALLOWED_BROWSER_ORIGINS = new Set(parseAllowedOriginsFromEnv());
+
+function isBrowserOriginAllowed(origin) {
+  if (!origin) return true;
+  return ALLOWED_BROWSER_ORIGINS.has(origin);
+}
+
 const app = express();
 
-/** Reflect browser Origin (`credentials: false`) — works for every Vercel URL without maintaining an allowlist. */
+/** Needed so rate limiting sees the real client IP behind Railway / other proxies. */
+app.set(
+  "trust proxy",
+  Number.parseInt(process.env.TRUST_PROXY_HOPS ?? "1", 10) || 1
+);
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
+
 app.use(
   cors({
-    origin: true,
+    origin(origin, callback) {
+      if (isBrowserOriginAllowed(origin)) {
+        callback(null, origin || true);
+        return;
+      }
+      if (origin) {
+        console.warn("[relayer][cors] rejected Origin:", origin);
+      }
+      callback(null, false);
+    },
     methods: ["GET", "POST", "OPTIONS", "HEAD"],
     allowedHeaders: [
       "Content-Type",
@@ -473,6 +525,31 @@ app.use(
     optionsSuccessStatus: 204,
   })
 );
+
+const withdrawLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number.parseInt(process.env.RATE_LIMIT_WITHDRAW_MAX ?? "45", 10) || 45,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many withdrawal requests; try again shortly." },
+});
+
+const burnerWalletLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: Number.parseInt(process.env.RATE_LIMIT_BURNER_MAX ?? "20", 10) || 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Burner wallet generation limit exceeded; try again later." },
+});
+
+/** Rate-limit POST /relay only when it forwards to withdraw (same cost as /withdraw). */
+function relayWithdrawRateLimit(req, res, next) {
+  if (req.method === "POST" && req.body?.action === "withdraw") {
+    return withdrawLimiter(req, res, next);
+  }
+  return next();
+}
+
 app.use(express.json({ limit: "4mb" }));
 app.use(sanctionsComplianceMiddleware);
 
@@ -921,12 +998,12 @@ function sendBurnerWallet(res) {
   });
 }
 
-app.get("/generate-burner", (_req, res) => sendBurnerWallet(res));
-app.post("/generate-burner", (_req, res) => sendBurnerWallet(res));
+app.get("/generate-burner", burnerWalletLimiter, (_req, res) => sendBurnerWallet(res));
+app.post("/generate-burner", burnerWalletLimiter, (_req, res) => sendBurnerWallet(res));
 
-app.post("/withdraw", handleWithdraw);
+app.post("/withdraw", withdrawLimiter, handleWithdraw);
 
-app.post("/relay", async (req, res) => {
+app.post("/relay", relayWithdrawRateLimit, async (req, res) => {
   if (!ensureRelayerReady(res)) return;
   try {
     if (req.body && req.body.action === "withdraw") {
@@ -969,7 +1046,13 @@ app.use((err, _req, res, _next) => {
 async function logStartupDetails() {
   console.log("Pools (by denom key):", { ...POOL_ADDRESSES_BY_DENOM_KEY });
   console.log("Mock USDT:", MOCK_USDT_ADDRESS);
-  console.log("CORS: permissive (reflect request Origin; credentials=false)");
+  if (ALLOWED_BROWSER_ORIGINS.size === 0) {
+    addStartupWarning(
+      "RELAYER_ALLOWED_ORIGINS is unset — browsers receive no Access-Control-Allow-Origin (set to your frontend URL, e.g. https://….vercel.app)."
+    );
+  } else {
+    console.log("CORS allowed origins:", [...ALLOWED_BROWSER_ORIGINS]);
+  }
   if (relayerWallet) {
     const signer = await relayerWallet.getAddress();
     console.log("Relayer wallet:", signer);
